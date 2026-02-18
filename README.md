@@ -852,25 +852,41 @@ JOIN cdo_restricted.tableau_dim_datasource dds
 WHERE dma.day_index > 0 AND dma.month_index > 0 AND dma.year_index > 0;
 
 
--- 3.4 Manual refresh button clicks (who is hammering refresh)
-CREATE OR REPLACE VIEW cdo_restricted.tableau_fct_view_refresh_clicks AS
+-- =========================================================
+-- 3.4 REPLACEMENT: Extract refresh monitoring (most recent)
+-- Source: ec_tableau_meta.most_recent_refreshes
+-- Note: "most recent refresh data for alerts" (not full history)
+-- Full history is from tableau_fct_background_jobs_enriched
+-- =========================================================
+
+CREATE OR REPLACE VIEW cdo_restricted.tableau_fct_extract_refresh_most_recent AS
 SELECT
-  vrt.site_id,
-  vrt.view_id,
-  dv.view_name,
-  dv.workbook_id,
-  dv.workbook_name,
-  vrt.user_id,
-  du.user_name,
-  du.user_email,
-  vrt.refreshed_at
-FROM ec_tableau_meta.view_refreshed_timestamps vrt
-JOIN cdo_restricted.tableau_dim_view dv
-  ON dv.site_id = vrt.site_id
- AND dv.view_id = vrt.view_id
-JOIN cdo_restricted.tableau_dim_user du
-  ON du.site_id = vrt.site_id
- AND du.user_id = vrt.user_id;
+  mrr.site_id,
+  mrr.id                       AS most_recent_refresh_id,
+  mrr.created_at               AS refresh_occurred_at,
+  mrr.duration_in_ms,
+  mrr.is_failure,
+  CASE WHEN mrr.is_failure THEN 'failure' ELSE 'success' END AS refresh_status,
+  mrr.worker,
+  mrr.task_id,
+  mrr.workbook_id,
+  dw.workbook_name,
+  dw.project_name              AS workbook_project_name,
+  mrr.datasource_id,
+  dds.datasource_name,
+  dds.project_name             AS datasource_project_name,
+  mrr.data_connection_id,
+  mrr.historical_event_type_id,
+  mrr.has_retry_job,
+  mrr.details
+
+FROM ec_tableau_meta.most_recent_refreshes mrr
+LEFT JOIN cdo_restricted.tableau_dim_workbook dw
+  ON dw.site_id = mrr.site_id
+ AND dw.workbook_id = mrr.workbook_id
+LEFT JOIN cdo_restricted.tableau_dim_datasource dds
+  ON dds.site_id = mrr.site_id
+ AND dds.datasource_id = mrr.datasource_id;
 
 
 -- 3.5 “Last content operation” (content_usage) – coarse but useful for stale content
