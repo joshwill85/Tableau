@@ -1,562 +1,454 @@
-# Databricks (PySpark) — Tableau Repo (PUBLIC-only) → row-level npdataset usage → Delta table (daily incremental partitions)
-#
-# What you get (ROW LEVEL):
-#   One row per (matched npdataset table) × (published datasource OR workbook_direct) × (downstream workbook) × (dashboard)
-#   + metadata (luid, repository_url, extract vs live/mixed)
-#
-# Incremental strategy that won’t miss due to retries:
-#   - Table is PARTITIONED by snapshot_date
-#   - Each run OVERWRITES ONLY today’s partition (idempotent)
-#   - Schedule as a daily job (or more frequent); re-runs won’t duplicate data
-#
-# Why you got 0 rows previously:
-#   Most common causes:
-#     1) data_connections.tablename is blank/null for your Databricks connections
-#     2) tablename doesn’t contain schema-qualified names (needs unqualified matching)
-#     3) you filtered to only_matches=True and there were simply no matches
-#
-# This notebook block adds DIAGNOSTICS + LOGGING so you can see exactly where the mismatch is.
-
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import date, datetime
-from typing import Optional, List
+from typing import List, Optional
 
 from pyspark.sql import DataFrame, functions as F
 
-
-# -----------------------------
-# CONFIG (placeholders for reuse)
-# -----------------------------
+# =========================
+# CONFIG (easy placeholders)
+# =========================
 CATALOG = "eciscor_prod"
-TABLEAU_SCHEMA = "ec_tableau_meta"           # UC schema containing Tableau repo tables (you renamed "public" -> this)
-NP_CATALOG = "eciscor_prod"                  # where npdataset lives
-NP_SCHEMA = "npdataset"                      # schema containing the tables you care about
+TABLEAU_SCHEMA = "ec_tableau_meta"
+
+NP_CATALOG = "eciscor_prod"
+NP_SCHEMA = "npdataset"
 
 TARGET_SCHEMA = "cdo"
-TARGET_TABLE = "npdatasetmetrics_tableau"    # eciscor_prod.cdo.npdatasetmetrics_tableau
+TARGET_TABLE = "npdatasetmetrics_tableau"   # -> eciscor_prod.cdo.npdatasetmetrics_tableau
 
-# Matching knobs
-MATCH_UNQUALIFIED_TABLE_NAMES = False        # flip True only if tablename often stores just "my_table"
-ONLY_MATCHES = True                          # write only rows that match npdataset
-FAIL_JOB_IF_EMPTY = True                     # fail the job if output is empty (prevents writing an empty day)
+DAYS_RUNTIME_WINDOW = 30                    # runtime lookback for Tableau queries
+FAIL_JOB_IF_EMPTY = True                    # fail instead of writing empty partition
 
+# If you have many npdataset tables and ANALYZE is too heavy daily, set to False and rely on existing stats
+RUN_ANALYZE_FOR_TABLE_STATS = False         # set True if you want to force-refresh stats nightly
 
-# -----------------------------
-# Helpers (logging + diagnostics)
-# -----------------------------
+# =========================
+# Logging helpers
+# =========================
 def log(msg: str) -> None:
     print(f"[{datetime.now().isoformat(timespec='seconds')}] {msg}")
 
-def table_fqn(schema: str, table: str, catalog: str = CATALOG) -> str:
+def fq(schema: str, table: str, catalog: str = CATALOG) -> str:
     return f"{catalog}.{schema}.{table}"
 
-def safe_count(df: DataFrame, name: str, sample_cols: Optional[List[str]] = None) -> int:
-    c = df.count()
-    log(f"{name}: {c:,} rows")
-    if c > 0:
-        if sample_cols:
-            display(df.select(*sample_cols).limit(20))
-        else:
-            display(df.limit(20))
-    return c
+def assert_exists(table_fqn: str) -> None:
+    if not spark.catalog.tableExists(table_fqn):
+        raise RuntimeError(f"Missing required table: {table_fqn}")
 
-def assert_table_exists(fqn: str) -> None:
-    if not spark.catalog.tableExists(fqn):
-        raise RuntimeError(f"Required table not found: {fqn}")
+# =========================
+# 1) Build ROW-LEVEL mapping from Tableau table_assets
+# =========================
+def build_rowlevel_table_assets_mapping() -> DataFrame:
+    """
+    Output rows are:
+      (npdataset table_asset) × (source workbook OR source datasource->consumer workbook) × (dashboard)
+    """
+    ta_fqn  = fq(TABLEAU_SCHEMA, "table_assets")
+    tas_fqn = fq(TABLEAU_SCHEMA, "table_asset_sources")
+    wb_fqn  = fq(TABLEAU_SCHEMA, "workbooks")
+    vw_fqn  = fq(TABLEAU_SCHEMA, "views")
+    pr_fqn  = fq(TABLEAU_SCHEMA, "projects")
+    ds_fqn  = fq(TABLEAU_SCHEMA, "datasources")
+    dc_fqn  = fq(TABLEAU_SCHEMA, "data_connections")
 
-def describe_if_exists(fqn: str) -> None:
-    if spark.catalog.tableExists(fqn):
-        log(f"DESCRIBE {fqn}")
-        display(spark.sql(f"DESCRIBE TABLE {fqn}"))
+    for t in [ta_fqn, tas_fqn, wb_fqn, vw_fqn, pr_fqn, ds_fqn, dc_fqn]:
+        assert_exists(t)
+
+    ta  = spark.table(ta_fqn)
+    tas = spark.table(tas_fqn)
+
+    # filter to npdataset
+    if "table_schema" in ta.columns:
+        ta_np = ta.where(F.lower(F.col("table_schema")) == F.lit(NP_SCHEMA.lower()))
     else:
-        log(f"DESCRIBE skipped (missing): {fqn}")
+        ta_np = ta.where(F.lower(F.coalesce(F.col("full_name"), F.lit(""))).like(f"%{NP_SCHEMA.lower()}%"))
 
-def run_diagnostics(
-    *,
-    catalog: str,
-    tableau_schema: str,
-    np_catalog: str,
-    np_schema: str,
-) -> None:
-    """
-    Prints diagnostics to explain why matches might be 0.
-    """
-    log("=== DIAGNOSTICS START ===")
+    if "is_tombstoned" in ta.columns:
+        ta_np = ta_np.where(~F.coalesce(F.col("is_tombstoned"), F.lit(False)))
 
-    # Required Tableau tables (public repo ingested into UC schema)
-    dc_fqn = table_fqn(tableau_schema, "data_connections", catalog)
-    ds_fqn = table_fqn(tableau_schema, "datasources", catalog)
-    wb_fqn = table_fqn(tableau_schema, "workbooks", catalog)
-    vw_fqn = table_fqn(tableau_schema, "views", catalog)
-    pr_fqn = table_fqn(tableau_schema, "projects", catalog)
-
-    for f in [dc_fqn, ds_fqn, wb_fqn, vw_fqn, pr_fqn]:
-        assert_table_exists(f)
-        log(f"Found: {f}")
-
-    # NP tables count
-    np_tables_df = spark.sql(f"""
-        SELECT lower(table_name) AS table_name
-        FROM {np_catalog}.information_schema.tables
-        WHERE lower(table_schema) = lower('{np_schema}')
-    """)
-    np_cnt = np_tables_df.count()
-    log(f"np_tables in {np_catalog}.{np_schema}: {np_cnt:,}")
-    if np_cnt == 0:
-        log("!!! No tables found in npdataset. Check NP_CATALOG/NP_SCHEMA or permissions.")
-        log("=== DIAGNOSTICS END ===")
-        return
-
-    # Basic data_connections profiling
-    dc = spark.table(dc_fqn)
-    log("data_connections schema (columns):")
-    print(dc.columns)
-
-    safe_count(dc, "data_connections (raw)", sample_cols=["site_id", "owner_type", "owner_id", "datasource_id", "has_extract", "tablename"])
-
-    # How many tablename are blank?
-    dc_tab = dc.select(
-        F.lower(F.col("owner_type")).alias("owner_type_lc"),
-        F.col("tablename").alias("tablename")
+    ta_np = ta_np.select(
+        F.col("site_id").alias("site_id"),
+        F.col("id").cast("long").alias("table_asset_id"),
+        F.col("name").alias("np_table_name"),
+        (F.col("table_schema") if "table_schema" in ta.columns else F.lit(NP_SCHEMA)).alias("np_table_schema"),
+        (F.col("full_name") if "full_name" in ta.columns else F.lit(None)).alias("table_full_name"),
     )
-    blanks = dc_tab.where((F.col("tablename").isNull()) | (F.trim(F.col("tablename")) == "")).count()
-    total = dc_tab.count()
-    log(f"data_connections.tablename blank/null: {blanks:,} / {total:,} ({(blanks/total*100):.1f}%)")
 
-    # Owner type distribution
-    log("Owner type distribution:")
-    display(dc_tab.groupBy("owner_type_lc").count().orderBy(F.desc("count")))
-
-    # Quick “does anything even mention npdataset?” scan
-    log("Quick scan: tablename contains 'npdataset' (case-insensitive)")
-    contains_npd = dc.where(F.lower(F.coalesce(F.col("tablename"), F.lit(""))).like("%npdataset%"))
-    safe_count(contains_npd, "Rows where tablename LIKE '%npdataset%'", sample_cols=["owner_type", "owner_id", "datasource_id", "has_extract", "tablename"])
-
-    # If 0, show a sample of non-empty tablename values to see what it looks like
-    if contains_npd.count() == 0:
-        log("No tablename contains 'npdataset'. Showing sample of distinct non-empty tablename strings:")
-        sample_tblnames = (
-            dc.where((F.col("tablename").isNotNull()) & (F.trim(F.col("tablename")) != ""))
-              .select(F.lower(F.col("tablename")).alias("tablename_lc"))
-              .distinct()
-              .limit(50)
+    src = (
+        tas.select(
+            F.col("site_id"),
+            F.col("table_asset_id").cast("long"),
+            F.lower(F.col("source_type")).alias("source_type"),
+            F.col("source_id").cast("long").alias("source_id"),
         )
-        display(sample_tblnames)
+        .join(ta_np, on=["site_id", "table_asset_id"], how="inner")
+    )
 
-    log("=== DIAGNOSTICS END ===")
+    # dims
+    workbooks = (
+        spark.table(wb_fqn)
+        .where(~F.coalesce(F.col("is_deleted"), F.lit(False)))
+        .select(
+            "site_id",
+            F.col("id").cast("long").alias("workbook_id"),
+            F.col("name").alias("workbook_name"),
+            F.col("repository_url").alias("workbook_repo_url"),
+            F.col("project_id").alias("project_id"),
+            F.col("luid").alias("workbook_luid"),
+        )
+    )
 
+    projects = spark.table(pr_fqn).select(
+        "site_id",
+        F.col("id").alias("project_id"),
+        F.col("name").alias("project_name"),
+    )
 
-# -----------------------------
-# Core build (ROW LEVEL matches)
-# -----------------------------
-def build_tableau_npdataset_usage_public_only_rowlevel(
-    *,
-    catalog: str = CATALOG,
-    tableau_schema: str = TABLEAU_SCHEMA,
-    np_catalog: str = NP_CATALOG,
-    np_schema: str = NP_SCHEMA,
-    match_unqualified_table_names: bool = MATCH_UNQUALIFIED_TABLE_NAMES,
-    only_matches: bool = ONLY_MATCHES,
-) -> DataFrame:
+    dashboards = (
+        spark.table(vw_fqn)
+        .where((F.lower(F.col("sheettype")) == F.lit("dashboard")) & (~F.coalesce(F.col("is_deleted"), F.lit(False))))
+        .select(
+            "site_id",
+            F.col("workbook_id").cast("long").alias("workbook_id"),
+            F.col("id").cast("long").alias("dashboard_id"),
+            F.col("name").alias("dashboard_name"),
+            F.col("repository_url").alias("dashboard_repo_url"),
+            F.col("luid").alias("dashboard_luid"),
+        )
+    )
+
+    datasources = spark.table(ds_fqn).select(
+        "site_id",
+        F.col("id").cast("long").alias("datasource_id"),
+        F.col("name").alias("datasource_name"),
+        F.col("repository_url").alias("datasource_repo_url"),
+        F.col("luid").alias("datasource_luid"),
+    )
+
+    dc = spark.table(dc_fqn)
+
+    # consumers of published datasource (doesn't require tablename)
+    consumers = (
+        dc.where((F.lower(F.col("owner_type")) == F.lit("workbook")) & F.col("datasource_id").isNotNull())
+          .select(
+              "site_id",
+              F.col("datasource_id").cast("long").alias("datasource_id"),
+              F.col("owner_id").cast("long").alias("workbook_id"),
+          )
+          .distinct()
+    )
+
+    # connection mode for datasource (live/extract/mixed)
+    ds_mode = (
+        dc.where(F.lower(F.col("owner_type")) == F.lit("datasource"))
+          .select(
+              "site_id",
+              F.col("owner_id").cast("long").alias("datasource_id"),
+              F.coalesce(F.col("has_extract"), F.lit(False)).alias("has_extract"),
+          )
+          .groupBy("site_id", "datasource_id")
+          .agg(
+              F.count("*").alias("num_connections"),
+              F.sum(F.col("has_extract").cast("int")).alias("num_extract_connections"),
+          )
+          .withColumn(
+              "connection_mode",
+              F.when(F.col("num_connections").isNull(), F.lit("unknown"))
+               .when(F.col("num_extract_connections") == 0, F.lit("live"))
+               .when(F.col("num_extract_connections") == F.col("num_connections"), F.lit("extract"))
+               .otherwise(F.lit("mixed"))
+          )
+          .select("site_id", "datasource_id", "connection_mode")
+    )
+
+    # Path A: source is workbook
+    wb_path = (
+        src.where(F.col("source_type") == F.lit("workbook"))
+           .withColumnRenamed("source_id", "workbook_id")
+           .withColumn("link_path", F.lit("table_asset_source_workbook"))
+           .join(workbooks, on=["site_id", "workbook_id"], how="left")
+           .join(projects, on=["site_id", "project_id"], how="left")
+           .join(dashboards, on=["site_id", "workbook_id"], how="left")
+           .select(
+               "site_id", "table_asset_id", "np_table_schema", "np_table_name", "table_full_name",
+               "link_path",
+               F.lit("workbook").alias("source_type"),
+               F.lit(None).cast("long").alias("datasource_id"),
+               F.lit(None).cast("string").alias("datasource_name"),
+               F.lit(None).cast("string").alias("datasource_repo_url"),
+               F.lit(None).cast("string").alias("datasource_luid"),
+               F.lit(None).cast("string").alias("connection_mode"),
+               "project_name",
+               "workbook_id","workbook_name","workbook_repo_url","workbook_luid",
+               "dashboard_id","dashboard_name","dashboard_repo_url","dashboard_luid",
+           )
+    )
+
+    # Path B: source is published datasource -> consumer workbooks
+    ds_path = (
+        src.where(F.col("source_type") == F.lit("datasource"))
+           .withColumnRenamed("source_id", "datasource_id")
+           .withColumn("link_path", F.lit("table_asset_source_datasource"))
+           .join(datasources, on=["site_id", "datasource_id"], how="left")
+           .join(ds_mode, on=["site_id", "datasource_id"], how="left")
+           .join(consumers, on=["site_id", "datasource_id"], how="left")
+           .join(workbooks, on=["site_id", "workbook_id"], how="left")
+           .join(projects, on=["site_id", "project_id"], how="left")
+           .join(dashboards, on=["site_id", "workbook_id"], how="left")
+           .select(
+               "site_id", "table_asset_id", "np_table_schema", "np_table_name", "table_full_name",
+               "link_path",
+               F.lit("datasource").alias("source_type"),
+               "datasource_id","datasource_name","datasource_repo_url","datasource_luid",
+               "connection_mode",
+               "project_name",
+               "workbook_id","workbook_name","workbook_repo_url","workbook_luid",
+               "dashboard_id","dashboard_name","dashboard_repo_url","dashboard_luid",
+           )
+    )
+
+    out = wb_path.unionByName(ds_path, allowMissingColumns=True)
+
+    # Add UC full name for the underlying table (what we’ll join to lineage/query metrics)
+    out = out.withColumn("uc_table_full_name", F.concat(F.lit(f"{NP_CATALOG}.{NP_SCHEMA}."), F.col("np_table_name")))
+
+    return out
+
+# =========================
+# 2) Enrichment: Databricks table stats (num_rows, size_in_bytes)
+#    Uses DESCRIBE TABLE EXTENDED ... AS JSON (DBR 16.2+)  [oai_citation:5‡Databricks Documentation](https://docs.databricks.com/aws/en/sql/language-manual/sql-ref-syntax-aux-describe-table)
+# =========================
+def get_uc_table_stats(table_full_names: List[str]) -> DataFrame:
     """
-    Returns ROW-LEVEL matches:
-      - one row per matched npdataset table × (datasource/workbook_direct) × workbook × dashboard
+    Returns: uc_table_full_name, uc_num_rows, uc_size_in_bytes, uc_stats_collected_at
     """
-    dc_fqn = table_fqn(tableau_schema, "data_connections", catalog)
-    ds_fqn = table_fqn(tableau_schema, "datasources", catalog)
-    wb_fqn = table_fqn(tableau_schema, "workbooks", catalog)
-    vw_fqn = table_fqn(tableau_schema, "views", catalog)
-    pr_fqn = table_fqn(tableau_schema, "projects", catalog)
-    is_tables_fqn = f"{np_catalog}.information_schema.tables"
+    stats_rows = []
+    for full_name in sorted(set(table_full_names)):
+        try:
+            if RUN_ANALYZE_FOR_TABLE_STATS:
+                # ANALYZE TABLE collects numRows and sizeInBytes  [oai_citation:6‡Databricks Documentation](https://docs.databricks.com/aws/en/sql/language-manual/sql-ref-syntax-aux-analyze-compute-statistics?utm_source=chatgpt.com)
+                spark.sql(f"ANALYZE TABLE {full_name} COMPUTE STATISTICS")
 
-    # Optional unqualified match clause (danger: false positives if table names collide across schemas)
-    unqualified_clause = "OR tablename_norm = nt.table_name" if match_unqualified_table_names else ""
+            ddf = spark.sql(f"DESCRIBE TABLE EXTENDED {full_name} AS JSON")  #  [oai_citation:7‡Databricks Documentation](https://docs.databricks.com/aws/en/sql/language-manual/sql-ref-syntax-aux-describe-table)
+            col0 = ddf.columns[0]
+            js = ddf.select(col0).first()[0]
+            payload = json.loads(js)
 
-    # If only_matches False, we still only produce “match rows” in this rowlevel function.
-    # (If you want all datasources with uses_npdataset=false rows, that’s a different output shape.)
-    where_only_matches = ""  # rowlevel hits are inherently "matches"
+            stats = payload.get("statistics", {}) or {}
+            stats_rows.append({
+                "uc_table_full_name": full_name,
+                "uc_num_rows": stats.get("num_rows"),
+                "uc_size_in_bytes": stats.get("size_in_bytes"),
+                "uc_stats_collected_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            })
+        except Exception as e:
+            # keep going; just log
+            log(f"[WARN] table stats failed for {full_name}: {type(e).__name__}: {e}")
+            stats_rows.append({
+                "uc_table_full_name": full_name,
+                "uc_num_rows": None,
+                "uc_size_in_bytes": None,
+                "uc_stats_collected_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            })
 
-    sql = f"""
-WITH np_tables AS (
-  SELECT lower(table_name) AS table_name
-  FROM {is_tables_fqn}
-  WHERE lower(table_schema) = lower('{np_schema}')
-),
+    return spark.createDataFrame(stats_rows)
 
-dc_norm AS (
-  SELECT
-    site_id,
-    id AS data_connection_id,
-    lower(owner_type) AS owner_type_lc,
-    owner_id,
-    datasource_id,
-    has_extract,
-    -- normalize: strip common quoting and lower
-    lower(
-      replace(
-        replace(
-          replace(
-            replace(coalesce(tablename, ''), '`', ''),
-          '"', ''),
-        '[', ''),
-      ']', '')
-    ) AS tablename_norm
-  FROM {dc_fqn}
-),
+# =========================
+# 3) Enrichment: Tableau extract size (bytes) (optional proxy)
+#    public.extracts has datasource_id/workbook_id + size bytes  [oai_citation:8‡Tableau](https://tableau.github.io/tableau-data-dictionary/2024.2/data_dictionary.htm)
+# =========================
+def add_tableau_extract_sizes(df: DataFrame) -> DataFrame:
+    extracts_fqn = fq(TABLEAU_SCHEMA, "extracts")
+    if not spark.catalog.tableExists(extracts_fqn):
+        log(f"[INFO] {extracts_fqn} not found; skipping extract size enrichment.")
+        return df.withColumn("tableau_extract_size_bytes", F.lit(None).cast("long")) \
+                 .withColumn("tableau_extract_updated_at", F.lit(None).cast("timestamp"))
 
--- -----------------------------
--- A) Published datasources: match npdataset tables via datasource-owned connections
--- -----------------------------
-published_ds_hits AS (
-  SELECT
-    p.site_id,
-    p.data_connection_id,
-    p.owner_id AS datasource_id,
-    p.has_extract,
-    p.tablename_norm,
-    nt.table_name AS matched_table
-  FROM dc_norm p
-  JOIN np_tables nt
-    ON p.owner_type_lc = 'datasource'
-   AND (
-        p.tablename_norm LIKE concat('%', lower('{np_schema}'), '.', nt.table_name, '%')
-     OR p.tablename_norm LIKE concat('%', lower('{np_catalog}'), '.', lower('{np_schema}'), '.', nt.table_name, '%')
-     {unqualified_clause}
-   )
-),
+    ex = spark.table(extracts_fqn).select(
+        "site_id",
+        F.col("datasource_id").cast("long").alias("ex_datasource_id"),
+        F.col("workbook_id").cast("long").alias("ex_workbook_id"),
+        F.col("size").cast("long").alias("extract_size_bytes"),
+        F.col("updated_at").alias("extract_updated_at"),
+    )
 
-published_ds_mode AS (
-  SELECT
-    site_id,
-    datasource_id,
-    count(*) AS num_connections,
-    sum(CASE WHEN has_extract THEN 1 ELSE 0 END) AS num_extract_connections
-  FROM dc_norm
-  WHERE owner_type_lc = 'datasource'
-  GROUP BY 1,2
-),
+    # Join twice: once by datasource_id, once by workbook_id, then coalesce
+    df1 = df.join(
+        ex,
+        on=[df.site_id == ex.site_id, df.datasource_id == ex.ex_datasource_id],
+        how="left"
+    ).drop(ex.site_id)
 
--- Workbooks that consume a published datasource (workbook-owned connections with datasource_id set)
-published_ds_consumers AS (
-  SELECT DISTINCT
-    site_id,
-    datasource_id,
-    owner_id AS workbook_id
-  FROM dc_norm
-  WHERE owner_type_lc = 'workbook'
-    AND datasource_id IS NOT NULL
-),
+    df1 = df1.withColumnRenamed("extract_size_bytes", "ds_extract_size_bytes") \
+             .withColumnRenamed("extract_updated_at", "ds_extract_updated_at")
 
-datasources_dim AS (
-  SELECT
-    site_id,
-    id   AS datasource_id,
-    name AS datasource_name,
-    repository_url AS datasource_repo_url,
-    luid AS datasource_luid
-  FROM {ds_fqn}
-),
+    df2 = df1.join(
+        ex,
+        on=[df1.site_id == ex.site_id, df1.workbook_id == ex.ex_workbook_id],
+        how="left"
+    ).drop(ex.site_id)
 
-workbooks_dim AS (
-  SELECT
-    site_id,
-    id   AS workbook_id,
-    name AS workbook_name,
-    repository_url AS workbook_repo_url,
-    project_id,
-    luid AS workbook_luid
-  FROM {wb_fqn}
-  WHERE coalesce(is_deleted, false) = false
-),
+    df2 = df2.withColumnRenamed("extract_size_bytes", "wb_extract_size_bytes") \
+             .withColumnRenamed("extract_updated_at", "wb_extract_updated_at")
 
-projects_dim AS (
-  SELECT
-    site_id,
-    id   AS project_id,
-    name AS project_name
-  FROM {pr_fqn}
-),
+    return (
+        df2
+        .withColumn("tableau_extract_size_bytes", F.coalesce(F.col("ds_extract_size_bytes"), F.col("wb_extract_size_bytes")))
+        .withColumn("tableau_extract_updated_at", F.coalesce(F.col("ds_extract_updated_at"), F.col("wb_extract_updated_at")))
+        .drop("ex_datasource_id","ex_workbook_id","ds_extract_size_bytes","ds_extract_updated_at","wb_extract_size_bytes","wb_extract_updated_at")
+    )
 
-dashboards_dim AS (
-  SELECT
-    site_id,
-    workbook_id,
-    id   AS dashboard_id,
-    name AS dashboard_name,
-    repository_url AS dashboard_repo_url,
-    luid AS dashboard_luid
-  FROM {vw_fqn}
-  WHERE lower(sheettype) = 'dashboard'
-    AND coalesce(is_deleted, false) = false
-),
-
-published_rows AS (
-  SELECT
-    h.site_id,
-    'published_datasource' AS datasource_kind,
-
-    ds.datasource_id,
-    ds.datasource_name,
-    ds.datasource_repo_url,
-    ds.datasource_luid,
-
-    true AS uses_npdataset,
-    h.matched_table,
-    h.data_connection_id,
-    h.has_extract,
-    h.tablename_norm AS matched_from_tablename,
-
-    CASE
-      WHEN m.num_connections IS NULL THEN 'unknown'
-      WHEN m.num_extract_connections = 0 THEN 'live'
-      WHEN m.num_extract_connections = m.num_connections THEN 'extract'
-      ELSE 'mixed'
-    END AS connection_mode,
-
-    pr.project_name,
-
-    wb.workbook_id,
-    wb.workbook_name,
-    wb.workbook_repo_url,
-    wb.workbook_luid,
-
-    db.dashboard_id,
-    db.dashboard_name,
-    db.dashboard_repo_url,
-    db.dashboard_luid
-
-  FROM published_ds_hits h
-  LEFT JOIN datasources_dim ds
-    ON ds.site_id = h.site_id AND ds.datasource_id = h.datasource_id
-  LEFT JOIN published_ds_mode m
-    ON m.site_id = h.site_id AND m.datasource_id = h.datasource_id
-  LEFT JOIN published_ds_consumers c
-    ON c.site_id = h.site_id AND c.datasource_id = h.datasource_id
-  LEFT JOIN workbooks_dim wb
-    ON wb.site_id = c.site_id AND wb.workbook_id = c.workbook_id
-  LEFT JOIN projects_dim pr
-    ON pr.site_id = wb.site_id AND pr.project_id = wb.project_id
-  LEFT JOIN dashboards_dim db
-    ON db.site_id = wb.site_id AND db.workbook_id = wb.workbook_id
-),
-
--- -----------------------------
--- B) Workbook-direct connections (no published datasource): match npdataset via workbook-owned connections where datasource_id is null
--- -----------------------------
-workbook_direct_hits AS (
-  SELECT
-    w.site_id,
-    w.data_connection_id,
-    w.owner_id AS workbook_id,
-    w.has_extract,
-    w.tablename_norm,
-    nt.table_name AS matched_table
-  FROM dc_norm w
-  JOIN np_tables nt
-    ON w.owner_type_lc = 'workbook'
-   AND w.datasource_id IS NULL
-   AND (
-        w.tablename_norm LIKE concat('%', lower('{np_schema}'), '.', nt.table_name, '%')
-     OR w.tablename_norm LIKE concat('%', lower('{np_catalog}'), '.', lower('{np_schema}'), '.', nt.table_name, '%')
-     {unqualified_clause}
-   )
-),
-
-workbook_direct_mode AS (
-  SELECT
-    site_id,
-    owner_id AS workbook_id,
-    count(*) AS num_connections,
-    sum(CASE WHEN has_extract THEN 1 ELSE 0 END) AS num_extract_connections
-  FROM dc_norm
-  WHERE owner_type_lc = 'workbook' AND datasource_id IS NULL
-  GROUP BY 1,2
-),
-
-workbook_direct_rows AS (
-  SELECT
-    h.site_id,
-    'workbook_direct' AS datasource_kind,
-
-    CAST(NULL AS BIGINT) AS datasource_id,
-    CAST(NULL AS STRING) AS datasource_name,
-    CAST(NULL AS STRING) AS datasource_repo_url,
-    CAST(NULL AS STRING) AS datasource_luid,
-
-    true AS uses_npdataset,
-    h.matched_table,
-    h.data_connection_id,
-    h.has_extract,
-    h.tablename_norm AS matched_from_tablename,
-
-    CASE
-      WHEN m.num_connections IS NULL THEN 'unknown'
-      WHEN m.num_extract_connections = 0 THEN 'live'
-      WHEN m.num_extract_connections = m.num_connections THEN 'extract'
-      ELSE 'mixed'
-    END AS connection_mode,
-
-    pr.project_name,
-
-    wb.workbook_id,
-    wb.workbook_name,
-    wb.workbook_repo_url,
-    wb.workbook_luid,
-
-    db.dashboard_id,
-    db.dashboard_name,
-    db.dashboard_repo_url,
-    db.dashboard_luid
-
-  FROM workbook_direct_hits h
-  JOIN workbooks_dim wb
-    ON wb.site_id = h.site_id AND wb.workbook_id = h.workbook_id
-  LEFT JOIN workbook_direct_mode m
-    ON m.site_id = h.site_id AND m.workbook_id = h.workbook_id
-  LEFT JOIN projects_dim pr
-    ON pr.site_id = wb.site_id AND pr.project_id = wb.project_id
-  LEFT JOIN dashboards_dim db
-    ON db.site_id = wb.site_id AND db.workbook_id = wb.workbook_id
-)
-
-SELECT * FROM published_rows
-UNION ALL
-SELECT * FROM workbook_direct_rows
-{where_only_matches}
-ORDER BY
-  datasource_kind, datasource_name, workbook_name, dashboard_name, matched_table
-"""
-    df = spark.sql(sql)
-
-    if only_matches:
-        # rowlevel output is already only matches; keep for symmetry
-        return df
-    else:
-        return df
-
-
-# -----------------------------
-# Write (daily incremental partitions)
-# -----------------------------
-def write_daily_partition(
-    df: DataFrame,
-    *,
-    target_catalog: str = CATALOG,
-    target_schema: str = TARGET_SCHEMA,
-    target_table: str = TARGET_TABLE,
-    snapshot_date: Optional[date] = None,
-    full_refresh: bool = False,
-) -> str:
+# =========================
+# 4) Enrichment: Runtime “rows read” from Tableau queries (Databricks system tables)
+#    query.history has read_rows/produced_rows/read_bytes  [oai_citation:9‡Databricks Documentation](https://docs.databricks.com/aws/en/admin/system-tables/query-history)
+#    table_lineage.statement_id joins to query history  [oai_citation:10‡Databricks Documentation](https://docs.databricks.com/aws/en/admin/system-tables/lineage?utm_source=chatgpt.com)
+# =========================
+def build_runtime_table_read_metrics(days: int = DAYS_RUNTIME_WINDOW) -> DataFrame:
     """
-    Writes df to Delta table partitioned by snapshot_date.
-      - full_refresh/create: overwrite entire table
-      - daily run: overwrite ONLY the snapshot_date partition (replaceWhere) — idempotent
-
-    NOTE: This is still "row-level"; snapshot_date is just an ingestion partition to support incremental loads.
+    Returns per-table runtime metrics (across ALL Tableau queries in the window):
+      uc_table_full_name, tableau_stmt_count, tableau_max_read_rows, tableau_max_produced_rows, tableau_max_read_bytes
     """
+    q = spark.sql(f"""
+      SELECT statement_id, start_time, client_application, read_rows, produced_rows, read_bytes
+      FROM system.query.history
+      WHERE start_time >= current_timestamp() - INTERVAL {days} DAYS
+        AND lower(client_application) = 'tableau'
+    """)
+    l = spark.sql(f"""
+      SELECT statement_id, source_table_full_name
+      FROM system.access.table_lineage
+      WHERE event_date >= current_date() - INTERVAL {days} DAYS
+        AND statement_id IS NOT NULL
+        AND source_table_full_name IS NOT NULL
+    """)
+
+    joined = (
+        q.join(l, on="statement_id", how="inner")
+         .withColumn("uc_table_full_name", F.col("source_table_full_name"))
+         .drop("source_table_full_name")
+    )
+
+    return (
+        joined.groupBy("uc_table_full_name")
+              .agg(
+                  F.countDistinct("statement_id").alias("tableau_stmt_count"),
+                  F.max("read_rows").alias("tableau_max_read_rows"),
+                  F.max("produced_rows").alias("tableau_max_produced_rows"),
+                  F.max("read_bytes").alias("tableau_max_read_bytes"),
+              )
+    )
+
+# =========================
+# 5) Write (daily partition, idempotent overwrite)
+# =========================
+def write_daily_partition(df: DataFrame, snapshot_date: Optional[date] = None) -> str:
     snapshot_date = snapshot_date or date.today()
-    snapshot_date_str = snapshot_date.isoformat()
+    snap_str = snapshot_date.isoformat()
 
-    target_fqn = f"{target_catalog}.{target_schema}.{target_table}"
-    spark.sql(f"CREATE SCHEMA IF NOT EXISTS {target_catalog}.{target_schema}")
+    target_fqn = f"{CATALOG}.{TARGET_SCHEMA}.{TARGET_TABLE}"
+    spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{TARGET_SCHEMA}")
 
     df_out = (
-        df
-        .withColumn("snapshot_date", F.lit(snapshot_date_str).cast("date"))
-        .withColumn("ingest_ts", F.current_timestamp())
-        .withColumn("ingest_run_id", F.lit(str(uuid.uuid4())))
-        # stable key for de-duping within a day if you ever want it
-        .withColumn(
-            "row_key",
-            F.sha2(
-                F.concat_ws(
-                    "||",
-                    F.coalesce(F.col("site_id").cast("string"), F.lit("")),
-                    F.coalesce(F.col("datasource_kind").cast("string"), F.lit("")),
-                    F.coalesce(F.col("datasource_id").cast("string"), F.lit("")),
-                    F.coalesce(F.col("workbook_id").cast("string"), F.lit("")),
-                    F.coalesce(F.col("dashboard_id").cast("string"), F.lit("")),
-                    F.coalesce(F.col("matched_table").cast("string"), F.lit("")),
-                ),
-                256
-            )
-        )
+        df.withColumn("snapshot_date", F.lit(snap_str).cast("date"))
+          .withColumn("ingest_ts", F.current_timestamp())
+          .withColumn("ingest_run_id", F.lit(str(uuid.uuid4())))
+          .withColumn(
+              "row_key",
+              F.sha2(
+                  F.concat_ws(
+                      "||",
+                      F.coalesce(F.col("site_id").cast("string"), F.lit("")),
+                      F.coalesce(F.col("table_asset_id").cast("string"), F.lit("")),
+                      F.coalesce(F.col("datasource_id").cast("string"), F.lit("")),
+                      F.coalesce(F.col("workbook_id").cast("string"), F.lit("")),
+                      F.coalesce(F.col("dashboard_id").cast("string"), F.lit("")),
+                      F.coalesce(F.col("uc_table_full_name").cast("string"), F.lit("")),
+                  ),
+                  256,
+              )
+          )
     )
 
-    table_exists = spark.catalog.tableExists(target_fqn)
-    if full_refresh or not table_exists:
-        log(f"Writing FULL REFRESH to {target_fqn} (partitioned by snapshot_date)")
-        (df_out.write
-            .format("delta")
-            .mode("overwrite")
-            .partitionBy("snapshot_date")
-            .saveAsTable(target_fqn))
+    # allow schema evolution (new columns)
+    spark.conf.set("spark.databricks.delta.schema.autoMerge.enabled", "true")
+
+    if not spark.catalog.tableExists(target_fqn):
+        log(f"Creating table {target_fqn}")
+        (df_out.write.format("delta")
+             .mode("overwrite")
+             .partitionBy("snapshot_date")
+             .saveAsTable(target_fqn))
     else:
-        log(f"Writing DAILY PARTITION to {target_fqn} for snapshot_date={snapshot_date_str} (idempotent overwrite)")
-        (df_out.write
-            .format("delta")
-            .mode("overwrite")
-            .option("replaceWhere", f"snapshot_date = '{snapshot_date_str}'")
-            .saveAsTable(target_fqn))
+        log(f"Overwriting partition snapshot_date={snap_str} in {target_fqn}")
+        (df_out.write.format("delta")
+             .mode("overwrite")
+             .option("replaceWhere", f"snapshot_date = '{snap_str}'")
+             .saveAsTable(target_fqn))
 
     return target_fqn
 
+# =========================
+# RUN
+# =========================
+log("Building row-level mapping from Tableau table_assets...")
+df_map = build_rowlevel_table_assets_mapping()
+map_cnt = df_map.count()
+log(f"df_map rows: {map_cnt:,}")
 
-# -----------------------------
-# RUN: Diagnose → Build → Write
-# -----------------------------
-log("Starting Tableau→npdataset metrics job")
+if map_cnt == 0 and FAIL_JOB_IF_EMPTY:
+    raise RuntimeError("No rows produced from table_assets mapping. Check table_assets/table_asset_sources population.")
 
-# 1) Diagnose (this will show why you might be getting 0 rows)
-run_diagnostics(
-    catalog=CATALOG,
-    tableau_schema=TABLEAU_SCHEMA,
-    np_catalog=NP_CATALOG,
-    np_schema=NP_SCHEMA,
+log("Enriching with UC table stats (num_rows, size_in_bytes)...")
+table_list = [r["uc_table_full_name"] for r in df_map.select("uc_table_full_name").distinct().collect()]
+df_stats = get_uc_table_stats(table_list)
+
+df_enriched = df_map.join(df_stats, on="uc_table_full_name", how="left")
+
+log("Enriching with Tableau extract size bytes (optional proxy)...")
+df_enriched = add_tableau_extract_sizes(df_enriched)
+
+log("Enriching with runtime read metrics from Tableau queries (last N days)...")
+df_runtime = build_runtime_table_read_metrics(days=DAYS_RUNTIME_WINDOW)
+df_enriched = df_enriched.join(df_runtime, on="uc_table_full_name", how="left")
+
+# Heuristic flags:
+df_enriched = (
+    df_enriched
+    .withColumn(
+        "suspected_full_table_read_runtime",
+        F.when(
+            (F.col("uc_num_rows").isNotNull()) & (F.col("tableau_max_read_rows").isNotNull()) &
+            (F.col("uc_num_rows") > 0) &
+            ((F.col("tableau_max_read_rows") / F.col("uc_num_rows")) >= F.lit(0.95)),
+            F.lit(True)
+        ).otherwise(F.lit(False))
+    )
+    .withColumn(
+        "suspected_full_table_extract_by_size",
+        F.when(
+            (F.col("uc_size_in_bytes").isNotNull()) & (F.col("tableau_extract_size_bytes").isNotNull()) &
+            (F.col("uc_size_in_bytes") > 0) &
+            ((F.col("tableau_extract_size_bytes") / F.col("uc_size_in_bytes")) >= F.lit(0.90)),
+            F.lit(True)
+        ).otherwise(F.lit(False))
+    )
 )
 
-# 2) Build row-level matches
-log("Building row-level dataset (PUBLIC-only matching via data_connections.tablename)")
-df_metrics = build_tableau_npdataset_usage_public_only_rowlevel(
-    catalog=CATALOG,
-    tableau_schema=TABLEAU_SCHEMA,
-    np_catalog=NP_CATALOG,
-    np_schema=NP_SCHEMA,
-    match_unqualified_table_names=MATCH_UNQUALIFIED_TABLE_NAMES,
-    only_matches=ONLY_MATCHES,
+final_cnt = df_enriched.count()
+log(f"df_enriched rows: {final_cnt:,}")
+
+if final_cnt == 0 and FAIL_JOB_IF_EMPTY:
+    raise RuntimeError("Final dataset is empty; refusing to write empty partition.")
+
+target = write_daily_partition(df_enriched, snapshot_date=None)
+log(f"Wrote: {target}")
+
+display(
+    spark.table(target)
+         .where(F.col("snapshot_date") == F.lit(date.today().isoformat()).cast("date"))
+         .orderBy("np_table_name", "datasource_name", "workbook_name", "dashboard_name")
+         .limit(200)
 )
-
-metrics_cnt = df_metrics.count()
-log(f"Built df_metrics: {metrics_cnt:,} rows")
-
-if metrics_cnt == 0:
-    log("!!! df_metrics is empty.")
-    log("Next steps to pinpoint cause:")
-    log("  - Check diagnostic output: do any data_connections.tablename values contain 'npdataset'?")
-    log("  - If not, your environment likely doesn’t store physical table names in public.data_connections.tablename")
-    log("  - If tablename has only unqualified names, set MATCH_UNQUALIFIED_TABLE_NAMES=True (risk: false positives)")
-    if FAIL_JOB_IF_EMPTY:
-        raise RuntimeError("df_metrics is empty — failing job to prevent writing an empty partition.")
-else:
-    display(df_metrics.limit(50))
-
-# 3) Write to eciscor_prod.cdo.npdatasetmetrics_tableau (daily incremental partition)
-target_fqn = write_daily_partition(
-    df_metrics,
-    target_catalog=CATALOG,
-    target_schema=TARGET_SCHEMA,
-    target_table=TARGET_TABLE,
-    snapshot_date=None,     # today
-    full_refresh=False,     # set True once for initial create/replace
-)
-
-log(f"Write complete: {target_fqn}")
-
-# 4) Quick verification for today's partition
-log("Verifying today's partition")
-today_str = date.today().isoformat()
-df_today = spark.table(target_fqn).where(F.col("snapshot_date") == F.lit(today_str).cast("date"))
-log(f"Rows written today: {df_today.count():,}")
-display(df_today.orderBy(F.col("datasource_kind"), F.col("datasource_name"), F.col("workbook_name"), F.col("matched_table")).limit(100))
