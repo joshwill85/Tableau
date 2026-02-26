@@ -1,61 +1,182 @@
-# Databricks (PySpark) — Tableau repo (PUBLIC-ONLY) → npdataset usage → write daily snapshot
+# Databricks (PySpark) — Tableau Repo (PUBLIC-only) → row-level npdataset usage → Delta table (daily incremental partitions)
 #
-# What this produces (row-level):
-#   - published datasource OR workbook_direct
-#   - whether it (best-effort) references eciscor_prod.npdataset.* based on Tableau repo:
-#       eciscor_prod.ec_tableau_meta.data_connections.tablename
-#   - downstream workbooks + dashboards (for published datasources)
+# What you get (ROW LEVEL):
+#   One row per (matched npdataset table) × (published datasource OR workbook_direct) × (downstream workbook) × (dashboard)
+#   + metadata (luid, repository_url, extract vs live/mixed)
 #
-# Incremental strategy (safe / “don’t miss data”):
-#   - Write a DAILY SNAPSHOT partitioned by snapshot_date
-#   - Each run OVERWRITES ONLY that day’s partition (idempotent; reruns won’t duplicate)
-#   - This guarantees you never “miss” a day due to retries/re-runs.
-#   - Note: This is *design-time metadata*, not event history; if you need intraday changes, run more frequently.
+# Incremental strategy that won’t miss due to retries:
+#   - Table is PARTITIONED by snapshot_date
+#   - Each run OVERWRITES ONLY today’s partition (idempotent)
+#   - Schedule as a daily job (or more frequent); re-runs won’t duplicate data
+#
+# Why you got 0 rows previously:
+#   Most common causes:
+#     1) data_connections.tablename is blank/null for your Databricks connections
+#     2) tablename doesn’t contain schema-qualified names (needs unqualified matching)
+#     3) you filtered to only_matches=True and there were simply no matches
+#
+# This notebook block adds DIAGNOSTICS + LOGGING so you can see exactly where the mismatch is.
 
 from __future__ import annotations
 
 import uuid
-from datetime import date
-from typing import Optional
+from datetime import date, datetime
+from typing import Optional, List
 
 from pyspark.sql import DataFrame, functions as F
 
 
-def build_tableau_npdataset_usage_public_only(
+# -----------------------------
+# CONFIG (placeholders for reuse)
+# -----------------------------
+CATALOG = "eciscor_prod"
+TABLEAU_SCHEMA = "ec_tableau_meta"           # UC schema containing Tableau repo tables (you renamed "public" -> this)
+NP_CATALOG = "eciscor_prod"                  # where npdataset lives
+NP_SCHEMA = "npdataset"                      # schema containing the tables you care about
+
+TARGET_SCHEMA = "cdo"
+TARGET_TABLE = "npdatasetmetrics_tableau"    # eciscor_prod.cdo.npdatasetmetrics_tableau
+
+# Matching knobs
+MATCH_UNQUALIFIED_TABLE_NAMES = False        # flip True only if tablename often stores just "my_table"
+ONLY_MATCHES = True                          # write only rows that match npdataset
+FAIL_JOB_IF_EMPTY = True                     # fail the job if output is empty (prevents writing an empty day)
+
+
+# -----------------------------
+# Helpers (logging + diagnostics)
+# -----------------------------
+def log(msg: str) -> None:
+    print(f"[{datetime.now().isoformat(timespec='seconds')}] {msg}")
+
+def table_fqn(schema: str, table: str, catalog: str = CATALOG) -> str:
+    return f"{catalog}.{schema}.{table}"
+
+def safe_count(df: DataFrame, name: str, sample_cols: Optional[List[str]] = None) -> int:
+    c = df.count()
+    log(f"{name}: {c:,} rows")
+    if c > 0:
+        if sample_cols:
+            display(df.select(*sample_cols).limit(20))
+        else:
+            display(df.limit(20))
+    return c
+
+def assert_table_exists(fqn: str) -> None:
+    if not spark.catalog.tableExists(fqn):
+        raise RuntimeError(f"Required table not found: {fqn}")
+
+def describe_if_exists(fqn: str) -> None:
+    if spark.catalog.tableExists(fqn):
+        log(f"DESCRIBE {fqn}")
+        display(spark.sql(f"DESCRIBE TABLE {fqn}"))
+    else:
+        log(f"DESCRIBE skipped (missing): {fqn}")
+
+def run_diagnostics(
     *,
-    catalog: str = "eciscor_prod",
-    tableau_schema: str = "ec_tableau_meta",
-    np_catalog: Optional[str] = None,
-    np_schema: str = "npdataset",
-    match_unqualified_table_names: bool = False,
-    only_matches: bool = True,
+    catalog: str,
+    tableau_schema: str,
+    np_catalog: str,
+    np_schema: str,
+) -> None:
+    """
+    Prints diagnostics to explain why matches might be 0.
+    """
+    log("=== DIAGNOSTICS START ===")
+
+    # Required Tableau tables (public repo ingested into UC schema)
+    dc_fqn = table_fqn(tableau_schema, "data_connections", catalog)
+    ds_fqn = table_fqn(tableau_schema, "datasources", catalog)
+    wb_fqn = table_fqn(tableau_schema, "workbooks", catalog)
+    vw_fqn = table_fqn(tableau_schema, "views", catalog)
+    pr_fqn = table_fqn(tableau_schema, "projects", catalog)
+
+    for f in [dc_fqn, ds_fqn, wb_fqn, vw_fqn, pr_fqn]:
+        assert_table_exists(f)
+        log(f"Found: {f}")
+
+    # NP tables count
+    np_tables_df = spark.sql(f"""
+        SELECT lower(table_name) AS table_name
+        FROM {np_catalog}.information_schema.tables
+        WHERE lower(table_schema) = lower('{np_schema}')
+    """)
+    np_cnt = np_tables_df.count()
+    log(f"np_tables in {np_catalog}.{np_schema}: {np_cnt:,}")
+    if np_cnt == 0:
+        log("!!! No tables found in npdataset. Check NP_CATALOG/NP_SCHEMA or permissions.")
+        log("=== DIAGNOSTICS END ===")
+        return
+
+    # Basic data_connections profiling
+    dc = spark.table(dc_fqn)
+    log("data_connections schema (columns):")
+    print(dc.columns)
+
+    safe_count(dc, "data_connections (raw)", sample_cols=["site_id", "owner_type", "owner_id", "datasource_id", "has_extract", "tablename"])
+
+    # How many tablename are blank?
+    dc_tab = dc.select(
+        F.lower(F.col("owner_type")).alias("owner_type_lc"),
+        F.col("tablename").alias("tablename")
+    )
+    blanks = dc_tab.where((F.col("tablename").isNull()) | (F.trim(F.col("tablename")) == "")).count()
+    total = dc_tab.count()
+    log(f"data_connections.tablename blank/null: {blanks:,} / {total:,} ({(blanks/total*100):.1f}%)")
+
+    # Owner type distribution
+    log("Owner type distribution:")
+    display(dc_tab.groupBy("owner_type_lc").count().orderBy(F.desc("count")))
+
+    # Quick “does anything even mention npdataset?” scan
+    log("Quick scan: tablename contains 'npdataset' (case-insensitive)")
+    contains_npd = dc.where(F.lower(F.coalesce(F.col("tablename"), F.lit(""))).like("%npdataset%"))
+    safe_count(contains_npd, "Rows where tablename LIKE '%npdataset%'", sample_cols=["owner_type", "owner_id", "datasource_id", "has_extract", "tablename"])
+
+    # If 0, show a sample of non-empty tablename values to see what it looks like
+    if contains_npd.count() == 0:
+        log("No tablename contains 'npdataset'. Showing sample of distinct non-empty tablename strings:")
+        sample_tblnames = (
+            dc.where((F.col("tablename").isNotNull()) & (F.trim(F.col("tablename")) != ""))
+              .select(F.lower(F.col("tablename")).alias("tablename_lc"))
+              .distinct()
+              .limit(50)
+        )
+        display(sample_tblnames)
+
+    log("=== DIAGNOSTICS END ===")
+
+
+# -----------------------------
+# Core build (ROW LEVEL matches)
+# -----------------------------
+def build_tableau_npdataset_usage_public_only_rowlevel(
+    *,
+    catalog: str = CATALOG,
+    tableau_schema: str = TABLEAU_SCHEMA,
+    np_catalog: str = NP_CATALOG,
+    np_schema: str = NP_SCHEMA,
+    match_unqualified_table_names: bool = MATCH_UNQUALIFIED_TABLE_NAMES,
+    only_matches: bool = ONLY_MATCHES,
 ) -> DataFrame:
     """
-    Build a row-level DataFrame from Tableau Server Postgres repository tables (PUBLIC-ONLY approach).
-
-    Returns columns:
-      datasource_kind, datasource_id, datasource_name, datasource_repo_url, datasource_luid,
-      uses_npdataset, matched_table_count, matched_tables,
-      connection_mode,
-      project_name,
-      workbook_id, workbook_name, workbook_repo_url, workbook_luid,
-      dashboard_id, dashboard_name, dashboard_repo_url, dashboard_luid
+    Returns ROW-LEVEL matches:
+      - one row per matched npdataset table × (datasource/workbook_direct) × workbook × dashboard
     """
-    np_catalog = np_catalog or catalog
-
-    # Fully-qualified UC table names
-    dc_fqn = f"{catalog}.{tableau_schema}.data_connections"
-    ds_fqn = f"{catalog}.{tableau_schema}.datasources"
-    wb_fqn = f"{catalog}.{tableau_schema}.workbooks"
-    vw_fqn = f"{catalog}.{tableau_schema}.views"
-    pr_fqn = f"{catalog}.{tableau_schema}.projects"
+    dc_fqn = table_fqn(tableau_schema, "data_connections", catalog)
+    ds_fqn = table_fqn(tableau_schema, "datasources", catalog)
+    wb_fqn = table_fqn(tableau_schema, "workbooks", catalog)
+    vw_fqn = table_fqn(tableau_schema, "views", catalog)
+    pr_fqn = table_fqn(tableau_schema, "projects", catalog)
     is_tables_fqn = f"{np_catalog}.information_schema.tables"
 
-    # Optional unqualified match clause
+    # Optional unqualified match clause (danger: false positives if table names collide across schemas)
     unqualified_clause = "OR tablename_norm = nt.table_name" if match_unqualified_table_names else ""
 
-    # If only_matches=True, filter to matching published datasources only
-    published_filter = "WHERE nr.datasource_id IS NOT NULL" if only_matches else ""
+    # If only_matches False, we still only produce “match rows” in this rowlevel function.
+    # (If you want all datasources with uses_npdataset=false rows, that’s a different output shape.)
+    where_only_matches = ""  # rowlevel hits are inherently "matches"
 
     sql = f"""
 WITH np_tables AS (
@@ -64,7 +185,6 @@ WITH np_tables AS (
   WHERE lower(table_schema) = lower('{np_schema}')
 ),
 
--- Normalize connection tablename strings for matching
 dc_norm AS (
   SELECT
     site_id,
@@ -73,6 +193,7 @@ dc_norm AS (
     owner_id,
     datasource_id,
     has_extract,
+    -- normalize: strip common quoting and lower
     lower(
       replace(
         replace(
@@ -86,39 +207,24 @@ dc_norm AS (
 ),
 
 -- -----------------------------
--- A) PUBLISHED DATASOURCES
+-- A) Published datasources: match npdataset tables via datasource-owned connections
 -- -----------------------------
-published_ds_connections AS (
-  SELECT
-    site_id,
-    data_connection_id,
-    owner_id AS datasource_id,     -- owner_type='datasource' => published datasource id
-    has_extract,
-    tablename_norm
-  FROM dc_norm
-  WHERE owner_type_lc = 'datasource'
-),
-
-published_ds_np_hits AS (
+published_ds_hits AS (
   SELECT
     p.site_id,
-    p.datasource_id,
+    p.data_connection_id,
+    p.owner_id AS datasource_id,
+    p.has_extract,
+    p.tablename_norm,
     nt.table_name AS matched_table
-  FROM published_ds_connections p
+  FROM dc_norm p
   JOIN np_tables nt
-    ON  p.tablename_norm LIKE concat('%', lower('{np_schema}'), '.', nt.table_name, '%')
+    ON p.owner_type_lc = 'datasource'
+   AND (
+        p.tablename_norm LIKE concat('%', lower('{np_schema}'), '.', nt.table_name, '%')
      OR p.tablename_norm LIKE concat('%', lower('{np_catalog}'), '.', lower('{np_schema}'), '.', nt.table_name, '%')
      {unqualified_clause}
-),
-
-published_ds_np_rollup AS (
-  SELECT
-    site_id,
-    datasource_id,
-    count(DISTINCT matched_table) AS matched_table_count,
-    concat_ws(', ', sort_array(collect_set(matched_table))) AS matched_tables
-  FROM published_ds_np_hits
-  GROUP BY 1,2
+   )
 ),
 
 published_ds_mode AS (
@@ -127,10 +233,12 @@ published_ds_mode AS (
     datasource_id,
     count(*) AS num_connections,
     sum(CASE WHEN has_extract THEN 1 ELSE 0 END) AS num_extract_connections
-  FROM published_ds_connections
+  FROM dc_norm
+  WHERE owner_type_lc = 'datasource'
   GROUP BY 1,2
 ),
 
+-- Workbooks that consume a published datasource (workbook-owned connections with datasource_id set)
 published_ds_consumers AS (
   SELECT DISTINCT
     site_id,
@@ -186,15 +294,19 @@ dashboards_dim AS (
 
 published_rows AS (
   SELECT
+    h.site_id,
     'published_datasource' AS datasource_kind,
+
     ds.datasource_id,
     ds.datasource_name,
     ds.datasource_repo_url,
     ds.datasource_luid,
 
-    CASE WHEN nr.datasource_id IS NOT NULL THEN true ELSE false END AS uses_npdataset,
-    coalesce(nr.matched_table_count, 0) AS matched_table_count,
-    coalesce(nr.matched_tables, '')     AS matched_tables,
+    true AS uses_npdataset,
+    h.matched_table,
+    h.data_connection_id,
+    h.has_extract,
+    h.tablename_norm AS matched_from_tablename,
 
     CASE
       WHEN m.num_connections IS NULL THEN 'unknown'
@@ -215,83 +327,72 @@ published_rows AS (
     db.dashboard_repo_url,
     db.dashboard_luid
 
-  FROM datasources_dim ds
-  LEFT JOIN published_ds_np_rollup nr
-    ON nr.site_id = ds.site_id AND nr.datasource_id = ds.datasource_id
+  FROM published_ds_hits h
+  LEFT JOIN datasources_dim ds
+    ON ds.site_id = h.site_id AND ds.datasource_id = h.datasource_id
   LEFT JOIN published_ds_mode m
-    ON m.site_id = ds.site_id AND m.datasource_id = ds.datasource_id
+    ON m.site_id = h.site_id AND m.datasource_id = h.datasource_id
   LEFT JOIN published_ds_consumers c
-    ON c.site_id = ds.site_id AND c.datasource_id = ds.datasource_id
+    ON c.site_id = h.site_id AND c.datasource_id = h.datasource_id
   LEFT JOIN workbooks_dim wb
     ON wb.site_id = c.site_id AND wb.workbook_id = c.workbook_id
   LEFT JOIN projects_dim pr
     ON pr.site_id = wb.site_id AND pr.project_id = wb.project_id
   LEFT JOIN dashboards_dim db
     ON db.site_id = wb.site_id AND db.workbook_id = wb.workbook_id
-
-  {published_filter}
 ),
 
 -- -----------------------------
--- B) WORKBOOK-DIRECT CONNECTIONS (no published datasource)
+-- B) Workbook-direct connections (no published datasource): match npdataset via workbook-owned connections where datasource_id is null
 -- -----------------------------
-workbook_direct_connections AS (
-  SELECT
-    site_id,
-    data_connection_id,
-    owner_id AS workbook_id,
-    has_extract,
-    tablename_norm
-  FROM dc_norm
-  WHERE owner_type_lc = 'workbook'
-    AND datasource_id IS NULL
-),
-
-workbook_direct_np_hits AS (
+workbook_direct_hits AS (
   SELECT
     w.site_id,
-    w.workbook_id,
+    w.data_connection_id,
+    w.owner_id AS workbook_id,
+    w.has_extract,
+    w.tablename_norm,
     nt.table_name AS matched_table
-  FROM workbook_direct_connections w
+  FROM dc_norm w
   JOIN np_tables nt
-    ON  w.tablename_norm LIKE concat('%', lower('{np_schema}'), '.', nt.table_name, '%')
+    ON w.owner_type_lc = 'workbook'
+   AND w.datasource_id IS NULL
+   AND (
+        w.tablename_norm LIKE concat('%', lower('{np_schema}'), '.', nt.table_name, '%')
      OR w.tablename_norm LIKE concat('%', lower('{np_catalog}'), '.', lower('{np_schema}'), '.', nt.table_name, '%')
      {unqualified_clause}
-),
-
-workbook_direct_rollup AS (
-  SELECT
-    site_id,
-    workbook_id,
-    count(DISTINCT matched_table) AS matched_table_count,
-    concat_ws(', ', sort_array(collect_set(matched_table))) AS matched_tables
-  FROM workbook_direct_np_hits
-  GROUP BY 1,2
+   )
 ),
 
 workbook_direct_mode AS (
   SELECT
     site_id,
-    workbook_id,
+    owner_id AS workbook_id,
     count(*) AS num_connections,
     sum(CASE WHEN has_extract THEN 1 ELSE 0 END) AS num_extract_connections
-  FROM workbook_direct_connections
+  FROM dc_norm
+  WHERE owner_type_lc = 'workbook' AND datasource_id IS NULL
   GROUP BY 1,2
 ),
 
 workbook_direct_rows AS (
   SELECT
+    h.site_id,
     'workbook_direct' AS datasource_kind,
+
     CAST(NULL AS BIGINT) AS datasource_id,
     CAST(NULL AS STRING) AS datasource_name,
     CAST(NULL AS STRING) AS datasource_repo_url,
     CAST(NULL AS STRING) AS datasource_luid,
 
     true AS uses_npdataset,
-    r.matched_table_count,
-    r.matched_tables,
+    h.matched_table,
+    h.data_connection_id,
+    h.has_extract,
+    h.tablename_norm AS matched_from_tablename,
 
     CASE
+      WHEN m.num_connections IS NULL THEN 'unknown'
       WHEN m.num_extract_connections = 0 THEN 'live'
       WHEN m.num_extract_connections = m.num_connections THEN 'extract'
       ELSE 'mixed'
@@ -309,11 +410,11 @@ workbook_direct_rows AS (
     db.dashboard_repo_url,
     db.dashboard_luid
 
-  FROM workbook_direct_rollup r
+  FROM workbook_direct_hits h
   JOIN workbooks_dim wb
-    ON wb.site_id = r.site_id AND wb.workbook_id = r.workbook_id
+    ON wb.site_id = h.site_id AND wb.workbook_id = h.workbook_id
   LEFT JOIN workbook_direct_mode m
-    ON m.site_id = r.site_id AND m.workbook_id = r.workbook_id
+    ON m.site_id = h.site_id AND m.workbook_id = h.workbook_id
   LEFT JOIN projects_dim pr
     ON pr.site_id = wb.site_id AND pr.project_id = wb.project_id
   LEFT JOIN dashboards_dim db
@@ -323,66 +424,77 @@ workbook_direct_rows AS (
 SELECT * FROM published_rows
 UNION ALL
 SELECT * FROM workbook_direct_rows
+{where_only_matches}
 ORDER BY
-  uses_npdataset DESC,
-  datasource_kind,
-  datasource_name,
-  workbook_name,
-  dashboard_name
+  datasource_kind, datasource_name, workbook_name, dashboard_name, matched_table
 """
-    return spark.sql(sql)
+    df = spark.sql(sql)
+
+    if only_matches:
+        # rowlevel output is already only matches; keep for symmetry
+        return df
+    else:
+        return df
 
 
-def write_daily_snapshot(
+# -----------------------------
+# Write (daily incremental partitions)
+# -----------------------------
+def write_daily_partition(
     df: DataFrame,
     *,
-    target_catalog: str = "eciscor_prod",
-    target_schema: str = "cdo",
-    target_table: str = "npdatasetmetrics_tableau",
+    target_catalog: str = CATALOG,
+    target_schema: str = TARGET_SCHEMA,
+    target_table: str = TARGET_TABLE,
     snapshot_date: Optional[date] = None,
     full_refresh: bool = False,
 ) -> str:
     """
-    Writes df to a Delta table partitioned by snapshot_date.
+    Writes df to Delta table partitioned by snapshot_date.
+      - full_refresh/create: overwrite entire table
+      - daily run: overwrite ONLY the snapshot_date partition (replaceWhere) — idempotent
 
-    - First run: creates the table (or full_refresh=True overwrites it)
-    - Daily runs: overwrite ONLY the snapshot_date partition (replaceWhere) -> idempotent
-
-    Returns the fully qualified table name.
+    NOTE: This is still "row-level"; snapshot_date is just an ingestion partition to support incremental loads.
     """
     snapshot_date = snapshot_date or date.today()
     snapshot_date_str = snapshot_date.isoformat()
 
     target_fqn = f"{target_catalog}.{target_schema}.{target_table}"
+    spark.sql(f"CREATE SCHEMA IF NOT EXISTS {target_catalog}.{target_schema}")
 
-    # Add ingestion columns + a stable row hash (useful for diffs/auditing)
-    # Note: This hash is based on business columns, not on timestamps.
-    business_cols = [c for c in df.columns]  # everything from the query is "business" for this snapshot
     df_out = (
         df
         .withColumn("snapshot_date", F.lit(snapshot_date_str).cast("date"))
         .withColumn("ingest_ts", F.current_timestamp())
         .withColumn("ingest_run_id", F.lit(str(uuid.uuid4())))
+        # stable key for de-duping within a day if you ever want it
         .withColumn(
-            "row_hash",
-            F.sha2(F.concat_ws("||", *[F.coalesce(F.col(c).cast("string"), F.lit("")) for c in business_cols]), 256)
+            "row_key",
+            F.sha2(
+                F.concat_ws(
+                    "||",
+                    F.coalesce(F.col("site_id").cast("string"), F.lit("")),
+                    F.coalesce(F.col("datasource_kind").cast("string"), F.lit("")),
+                    F.coalesce(F.col("datasource_id").cast("string"), F.lit("")),
+                    F.coalesce(F.col("workbook_id").cast("string"), F.lit("")),
+                    F.coalesce(F.col("dashboard_id").cast("string"), F.lit("")),
+                    F.coalesce(F.col("matched_table").cast("string"), F.lit("")),
+                ),
+                256
+            )
         )
     )
 
-    # Ensure schema exists
-    spark.sql(f"CREATE SCHEMA IF NOT EXISTS {target_catalog}.{target_schema}")
-
     table_exists = spark.catalog.tableExists(target_fqn)
-
     if full_refresh or not table_exists:
-        # Full load / create table
+        log(f"Writing FULL REFRESH to {target_fqn} (partitioned by snapshot_date)")
         (df_out.write
             .format("delta")
             .mode("overwrite")
             .partitionBy("snapshot_date")
             .saveAsTable(target_fqn))
     else:
-        # Incremental daily: replace only today's partition (safe on retries)
+        log(f"Writing DAILY PARTITION to {target_fqn} for snapshot_date={snapshot_date_str} (idempotent overwrite)")
         (df_out.write
             .format("delta")
             .mode("overwrite")
@@ -392,27 +504,59 @@ def write_daily_snapshot(
     return target_fqn
 
 
-# -------------------------
-# JOB ENTRYPOINT (daily)
-# -------------------------
-# 1) Build snapshot
-df_metrics = build_tableau_npdataset_usage_public_only(
-    catalog="eciscor_prod",
-    tableau_schema="ec_tableau_meta",
-    np_schema="npdataset",
-    match_unqualified_table_names=False,  # set True only if necessary
-    only_matches=True,                   # set False if you want all published datasources (including 0 matches)
+# -----------------------------
+# RUN: Diagnose → Build → Write
+# -----------------------------
+log("Starting Tableau→npdataset metrics job")
+
+# 1) Diagnose (this will show why you might be getting 0 rows)
+run_diagnostics(
+    catalog=CATALOG,
+    tableau_schema=TABLEAU_SCHEMA,
+    np_catalog=NP_CATALOG,
+    np_schema=NP_SCHEMA,
 )
 
-# 2) Write snapshot to eciscor_prod.cdo.npdatasetmetrics_tableau
-target = write_daily_snapshot(
+# 2) Build row-level matches
+log("Building row-level dataset (PUBLIC-only matching via data_connections.tablename)")
+df_metrics = build_tableau_npdataset_usage_public_only_rowlevel(
+    catalog=CATALOG,
+    tableau_schema=TABLEAU_SCHEMA,
+    np_catalog=NP_CATALOG,
+    np_schema=NP_SCHEMA,
+    match_unqualified_table_names=MATCH_UNQUALIFIED_TABLE_NAMES,
+    only_matches=ONLY_MATCHES,
+)
+
+metrics_cnt = df_metrics.count()
+log(f"Built df_metrics: {metrics_cnt:,} rows")
+
+if metrics_cnt == 0:
+    log("!!! df_metrics is empty.")
+    log("Next steps to pinpoint cause:")
+    log("  - Check diagnostic output: do any data_connections.tablename values contain 'npdataset'?")
+    log("  - If not, your environment likely doesn’t store physical table names in public.data_connections.tablename")
+    log("  - If tablename has only unqualified names, set MATCH_UNQUALIFIED_TABLE_NAMES=True (risk: false positives)")
+    if FAIL_JOB_IF_EMPTY:
+        raise RuntimeError("df_metrics is empty — failing job to prevent writing an empty partition.")
+else:
+    display(df_metrics.limit(50))
+
+# 3) Write to eciscor_prod.cdo.npdatasetmetrics_tableau (daily incremental partition)
+target_fqn = write_daily_partition(
     df_metrics,
-    target_catalog="eciscor_prod",
-    target_schema="cdo",
-    target_table="npdatasetmetrics_tableau",
-    snapshot_date=None,   # default: today
-    full_refresh=False,   # set True for your one-time initial “full load” if desired
+    target_catalog=CATALOG,
+    target_schema=TARGET_SCHEMA,
+    target_table=TARGET_TABLE,
+    snapshot_date=None,     # today
+    full_refresh=False,     # set True once for initial create/replace
 )
 
-print(f"Wrote snapshot to {target}")
-display(spark.table(target).orderBy(F.col("snapshot_date").desc()))
+log(f"Write complete: {target_fqn}")
+
+# 4) Quick verification for today's partition
+log("Verifying today's partition")
+today_str = date.today().isoformat()
+df_today = spark.table(target_fqn).where(F.col("snapshot_date") == F.lit(today_str).cast("date"))
+log(f"Rows written today: {df_today.count():,}")
+display(df_today.orderBy(F.col("datasource_kind"), F.col("datasource_name"), F.col("workbook_name"), F.col("matched_table")).limit(100))
