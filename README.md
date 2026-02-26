@@ -1,5 +1,5 @@
 # Databricks Notebook (PySpark)
-# ============================================
+# ============================================================
 # Tableau repo (table_assets) → ROW-LEVEL usage of eciscor_prod.npdataset.*
 # + optional enrichments:
 #   - UC table stats (num_rows, size_in_bytes) (best-effort; may be null if stats not collected)
@@ -11,16 +11,16 @@
 #   - partitioned by snapshot_date
 #   - each run overwrites ONLY today's partition (idempotent; reruns won’t duplicate)
 #
-# NOTE:
-#   This is “row-level” mapping (table × datasource/workbook × workbook × dashboard),
-#   while snapshot_date is just an ingestion partition so you can run daily and retain history.
+# Fixes included:
+#   - Explicit schema for df_stats (prevents “cannot determine type after inferring”)
+#   - Conforms df_out to existing Delta table schema (prevents “Delta failed to merge fields workbook_id and workbook_id”)
 
 from __future__ import annotations
 
 import json
 import uuid
 from datetime import date, datetime
-from typing import List, Optional
+from typing import List, Optional, Dict, Tuple
 
 from pyspark.sql import DataFrame, functions as F, types as T
 
@@ -69,6 +69,76 @@ def show_df(df: DataFrame, label: str, cols: Optional[List[str]] = None, n: int 
         display(df.select(*cols).limit(n) if cols else df.limit(n))
     return c
 
+def ensure_schema(catalog: str, schema: str) -> None:
+    spark.sql(f"CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}")
+
+def target_fqn() -> str:
+    return f"{CATALOG}.{TARGET_SCHEMA}.{TARGET_TABLE}"
+
+def _schema_map(schema: T.StructType) -> Dict[str, str]:
+    return {f.name: f.dataType.simpleString() for f in schema.fields}
+
+def _find_duplicate_columns(cols: List[str]) -> List[str]:
+    seen = set()
+    dups = []
+    for c in cols:
+        if c in seen and c not in dups:
+            dups.append(c)
+        seen.add(c)
+    return dups
+
+def conform_to_existing_delta_schema(df: DataFrame, target: str) -> DataFrame:
+    """
+    If target Delta table exists, cast columns in df to match existing types to avoid merge conflicts.
+    Also add any missing columns from target as nulls (cast to the target type).
+    Keeps any *new* columns in df as-is (schema evolution), but avoids type conflicts for existing fields.
+    """
+    if not spark.catalog.tableExists(target):
+        return df
+
+    tgt_schema = spark.table(target).schema
+    tgt_types = {f.name: f.dataType for f in tgt_schema.fields}
+
+    df_cols = set(df.columns)
+
+    # Cast existing target columns
+    out = df
+    for name, dtype in tgt_types.items():
+        if name in df_cols:
+            out = out.withColumn(name, F.col(name).cast(dtype))
+        else:
+            out = out.withColumn(name, F.lit(None).cast(dtype))
+
+    # Reorder: target columns first, then any new columns
+    ordered = [f.name for f in tgt_schema.fields] + [c for c in df.columns if c not in tgt_types]
+    out = out.select(*ordered)
+
+    # Sanity: duplicates
+    dups = _find_duplicate_columns(out.columns)
+    if dups:
+        raise RuntimeError(f"DataFrame has duplicate column names after conforming: {dups}")
+
+    return out
+
+def log_schema_diff(df: DataFrame, target: str) -> None:
+    if not spark.catalog.tableExists(target):
+        log("Target table does not exist yet; schema diff skipped.")
+        return
+    df_map = _schema_map(df.schema)
+    tgt_map = _schema_map(spark.table(target).schema)
+
+    mismatched = []
+    for k, tgt_t in tgt_map.items():
+        if k in df_map and df_map[k] != tgt_t:
+            mismatched.append((k, df_map[k], tgt_t))
+
+    if mismatched:
+        log("Schema type mismatches vs target (df_type -> target_type):")
+        for k, a, b in mismatched[:50]:
+            print(f"  - {k}: {a} -> {b}")
+    else:
+        log("No type mismatches vs target for existing columns.")
+
 
 # =========================
 # 0) Diagnostics (table_assets + sources)
@@ -114,7 +184,7 @@ def diagnose_table_assets() -> None:
     if "table_asset_id" not in tas.columns:
         raise RuntimeError("Expected column table_asset_id missing from table_asset_sources.")
 
-    # Join sources
+    # source_type distribution
     tas_np = tas.join(
         ta_np.select(
             F.col("site_id").alias("s_site_id"),
@@ -123,15 +193,12 @@ def diagnose_table_assets() -> None:
         (tas.site_id == F.col("s_site_id")) & (F.col("table_asset_id").cast("long") == F.col("s_table_asset_id")),
         "inner"
     )
-
     log("=== source_type distribution for npdataset table assets ===")
     display(
         tas_np.groupBy(F.lower(F.col("source_type")).alias("source_type"))
               .count()
               .orderBy(F.desc("count"))
     )
-
-    show_df(tas_np, "sample table_asset_sources rows for npdataset", n=25)
 
 
 # =========================
@@ -168,7 +235,7 @@ def build_rowlevel_mapping_from_table_assets() -> DataFrame:
         ta_np = ta_np.where(~F.coalesce(F.col("is_tombstoned"), F.lit(False)))
 
     ta_np_sel = ta_np.select(
-        F.col("site_id").alias("site_id"),
+        F.col("site_id").cast("long").alias("site_id"),
         F.col("id").cast("long").alias("table_asset_id"),
         F.col("name").alias("np_table_name"),
         table_schema_col.alias("np_table_schema"),
@@ -180,7 +247,7 @@ def build_rowlevel_mapping_from_table_assets() -> DataFrame:
 
     sources = (
         tas.select(
-            F.col("site_id"),
+            F.col("site_id").cast("long").alias("site_id"),
             F.col("table_asset_id").cast("long").alias("table_asset_id"),
             F.lower(F.col("source_type")).alias("source_type"),
             F.col("source_id").cast("long").alias("source_id"),
@@ -193,7 +260,7 @@ def build_rowlevel_mapping_from_table_assets() -> DataFrame:
         spark.table(wb_fqn)
         .where(~F.coalesce(F.col("is_deleted"), F.lit(False)))
         .select(
-            "site_id",
+            F.col("site_id").cast("long").alias("site_id"),
             F.col("id").cast("long").alias("workbook_id"),
             F.col("name").alias("workbook_name"),
             F.col("repository_url").alias("workbook_repo_url"),
@@ -203,7 +270,7 @@ def build_rowlevel_mapping_from_table_assets() -> DataFrame:
     )
 
     projects = spark.table(pr_fqn).select(
-        "site_id",
+        F.col("site_id").cast("long").alias("site_id"),
         F.col("id").alias("project_id"),
         F.col("name").alias("project_name"),
     )
@@ -212,7 +279,7 @@ def build_rowlevel_mapping_from_table_assets() -> DataFrame:
         spark.table(vw_fqn)
         .where((F.lower(F.col("sheettype")) == F.lit("dashboard")) & (~F.coalesce(F.col("is_deleted"), F.lit(False))))
         .select(
-            "site_id",
+            F.col("site_id").cast("long").alias("site_id"),
             F.col("workbook_id").cast("long").alias("workbook_id"),
             F.col("id").cast("long").alias("dashboard_id"),
             F.col("name").alias("dashboard_name"),
@@ -222,7 +289,7 @@ def build_rowlevel_mapping_from_table_assets() -> DataFrame:
     )
 
     datasources = spark.table(ds_fqn).select(
-        "site_id",
+        F.col("site_id").cast("long").alias("site_id"),
         F.col("id").cast("long").alias("datasource_id"),
         F.col("name").alias("datasource_name"),
         F.col("repository_url").alias("datasource_repo_url"),
@@ -235,18 +302,18 @@ def build_rowlevel_mapping_from_table_assets() -> DataFrame:
     consumers = (
         dc.where((F.lower(F.col("owner_type")) == F.lit("workbook")) & F.col("datasource_id").isNotNull())
           .select(
-              "site_id",
+              F.col("site_id").cast("long").alias("site_id"),
               F.col("datasource_id").cast("long").alias("datasource_id"),
               F.col("owner_id").cast("long").alias("workbook_id"),
           )
           .distinct()
     )
 
-    # Connection mode for datasource (live/extract/mixed) — does not rely on tablename
+    # Connection mode for datasource (live/extract/mixed)
     ds_mode = (
         dc.where(F.lower(F.col("owner_type")) == F.lit("datasource"))
           .select(
-              "site_id",
+              F.col("site_id").cast("long").alias("site_id"),
               F.col("owner_id").cast("long").alias("datasource_id"),
               F.coalesce(F.col("has_extract"), F.lit(False)).alias("has_extract"),
           )
@@ -342,11 +409,16 @@ def build_rowlevel_mapping_from_table_assets() -> DataFrame:
         F.concat(F.lit(f"{NP_CATALOG}.{NP_SCHEMA}."), F.col("np_table_name"))
     )
 
+    # Sanity: duplicates
+    dups = _find_duplicate_columns(out.columns)
+    if dups:
+        raise RuntimeError(f"Row-level mapping produced duplicate column names: {dups}")
+
     return out
 
 
 # =========================
-# 2) UC Table Stats Enrichment (FIXED: explicit schema, no inference)
+# 2) UC Table Stats Enrichment (explicit schema; no inference)
 # =========================
 UC_STATS_SCHEMA = T.StructType([
     T.StructField("uc_table_full_name", T.StringType(), False),
@@ -357,10 +429,6 @@ UC_STATS_SCHEMA = T.StructType([
 ])
 
 def get_uc_table_stats(table_full_names: List[str]) -> DataFrame:
-    """
-    Returns table stats for each table_full_name.
-    Uses explicit schema to avoid Spark 'cannot determine type' inference errors.
-    """
     if not table_full_names:
         return spark.createDataFrame([], schema=UC_STATS_SCHEMA)
 
@@ -372,14 +440,13 @@ def get_uc_table_stats(table_full_names: List[str]) -> DataFrame:
         uc_size_in_bytes = None
         src = None
 
-        # Optionally refresh stats (can be expensive)
         if RUN_ANALYZE_FOR_TABLE_STATS:
             try:
                 spark.sql(f"ANALYZE TABLE {full_name} COMPUTE STATISTICS")
             except Exception as e:
                 log(f"[WARN] ANALYZE failed for {full_name}: {type(e).__name__}: {e}")
 
-        # 1) Try DESCRIBE TABLE EXTENDED ... AS JSON
+        # Try JSON describe
         try:
             ddf = spark.sql(f"DESCRIBE TABLE EXTENDED {full_name} AS JSON")
             js = ddf.select(ddf.columns[0]).first()[0]
@@ -393,11 +460,10 @@ def get_uc_table_stats(table_full_names: List[str]) -> DataFrame:
         except Exception:
             pass
 
-        # 2) Fallback: DESCRIBE TABLE EXTENDED (parse 'Statistics' row)
+        # Fallback parse
         if src is None:
             try:
                 ext = spark.sql(f"DESCRIBE TABLE EXTENDED {full_name}")
-                # expected columns: col_name, data_type, comment (varies); we search for a row containing "Statistics"
                 cols = ext.columns
                 if len(cols) >= 2:
                     stats_row = (
@@ -408,7 +474,6 @@ def get_uc_table_stats(table_full_names: List[str]) -> DataFrame:
                     )
                     if stats_row:
                         s = stats_row[0]["stats_str"] or ""
-                        # common patterns contain 'numRows=' and 'sizeInBytes='
                         import re
                         m1 = re.search(r"numRows\s*=\s*([0-9]+)", s)
                         m2 = re.search(r"sizeInBytes\s*=\s*([0-9]+)", s)
@@ -420,7 +485,7 @@ def get_uc_table_stats(table_full_names: List[str]) -> DataFrame:
             except Exception:
                 pass
 
-        # 3) Fallback: DESCRIBE DETAIL (sizeInBytes only)
+        # Fallback describe detail for size
         if src is None:
             try:
                 det = spark.sql(f"DESCRIBE DETAIL {full_name}")
@@ -449,20 +514,13 @@ EXTRACT_SCHEMA = T.StructType([
 ])
 
 def get_tableau_extract_sizes() -> DataFrame:
-    """
-    Best-effort: returns (site_id, datasource_id, workbook_id, tableau_extract_size_bytes, tableau_extract_updated_at)
-    If table doesn't exist, returns empty DF with fixed schema.
-    """
     extracts_fqn = fqn(TABLEAU_SCHEMA, "extracts")
     if not spark.catalog.tableExists(extracts_fqn):
         log(f"[INFO] {extracts_fqn} not found; skipping extract size enrichment.")
         return spark.createDataFrame([], schema=EXTRACT_SCHEMA)
 
     ex = spark.table(extracts_fqn)
-
-    # Column presence can vary; handle common names
-    # Expected in Tableau repo: datasource_id, workbook_id, size, updated_at
-    if not all(c in ex.columns for c in ["size", "updated_at"]):
+    if not all(c in ex.columns for c in ["size", "updated_at", "site_id"]):
         log(f"[WARN] extracts table exists but missing expected columns. Found: {ex.columns}")
         return spark.createDataFrame([], schema=EXTRACT_SCHEMA)
 
@@ -492,10 +550,6 @@ RUNTIME_SCHEMA = T.StructType([
 ])
 
 def get_runtime_table_read_metrics(days: int = DAYS_RUNTIME_WINDOW) -> DataFrame:
-    """
-    Aggregate runtime metrics per source_table_full_name for Tableau queries.
-    If permissions/system tables unavailable, returns empty DF with fixed schema.
-    """
     try:
         q = spark.sql(f"""
           SELECT statement_id, read_rows, produced_rows, read_bytes
@@ -525,7 +579,6 @@ def get_runtime_table_read_metrics(days: int = DAYS_RUNTIME_WINDOW) -> DataFrame
             F.max("read_bytes").alias("tableau_max_read_bytes"),
         ).withColumn("runtime_window_days", F.lit(int(days)))
 
-        # Reorder to match schema
         return agg.select([f.name for f in RUNTIME_SCHEMA.fields])
 
     except Exception as e:
@@ -534,17 +587,19 @@ def get_runtime_table_read_metrics(days: int = DAYS_RUNTIME_WINDOW) -> DataFrame
 
 
 # =========================
-# 5) Write (daily partition, idempotent overwrite)
+# 5) Write (daily partition, idempotent overwrite) — with schema conformance
 # =========================
 def write_daily_partition(df: DataFrame, snapshot_date: Optional[date] = None) -> str:
     snapshot_date = snapshot_date or date.today()
     snap_str = snapshot_date.isoformat()
 
-    target_fqn = f"{CATALOG}.{TARGET_SCHEMA}.{TARGET_TABLE}"
-    spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{TARGET_SCHEMA}")
+    target = target_fqn()
+    ensure_schema(CATALOG, TARGET_SCHEMA)
 
     spark.conf.set("spark.databricks.delta.schema.autoMerge.enabled", "true")
+    spark.conf.set("spark.databricks.delta.schema.autoMerge.enabled", "true")
 
+    # Add ingestion columns
     df_out = (
         df.withColumn("snapshot_date", F.lit(snap_str).cast("date"))
           .withColumn("ingest_ts", F.current_timestamp())
@@ -567,20 +622,26 @@ def write_daily_partition(df: DataFrame, snapshot_date: Optional[date] = None) -
           )
     )
 
-    if not spark.catalog.tableExists(target_fqn):
-        log(f"Creating table {target_fqn}")
+    # Diagnose & fix schema conflicts against existing Delta table
+    log_schema_diff(df_out, target)
+    df_out = conform_to_existing_delta_schema(df_out, target)
+
+    # If table doesn't exist, create it; else overwrite only today's partition (idempotent)
+    if not spark.catalog.tableExists(target):
+        log(f"Creating table {target}")
         (df_out.write.format("delta")
              .mode("overwrite")
              .partitionBy("snapshot_date")
-             .saveAsTable(target_fqn))
+             .saveAsTable(target))
     else:
-        log(f"Overwriting partition snapshot_date={snap_str} in {target_fqn} (idempotent)")
+        log(f"Overwriting partition snapshot_date={snap_str} in {target} (idempotent)")
         (df_out.write.format("delta")
              .mode("overwrite")
              .option("replaceWhere", f"snapshot_date = '{snap_str}'")
-             .saveAsTable(target_fqn))
+             .option("mergeSchema", "true")
+             .saveAsTable(target))
 
-    return target_fqn
+    return target
 
 
 # =========================
@@ -594,24 +655,21 @@ df_map = build_rowlevel_mapping_from_table_assets()
 map_cnt = df_map.count()
 log(f"df_map rows: {map_cnt:,}")
 if map_cnt == 0 and FAIL_JOB_IF_EMPTY:
-    raise RuntimeError("df_map is empty. table_assets/table_asset_sources filter likely incorrect for your environment.")
-
+    raise RuntimeError("df_map is empty. Check table_assets/table_asset_sources population and schema filter.")
 display(df_map.limit(50))
 
 log("=== STEP 2: UC table stats (explicit schema; fixes 'cannot determine type') ===")
 table_list = [r["uc_table_full_name"] for r in df_map.select("uc_table_full_name").distinct().collect()]
 log(f"Distinct UC tables to stat: {len(table_list)}")
 log(f"Sample tables: {table_list[:10]}")
-df_stats = get_uc_table_stats(table_list)  # <-- THIS is the fixed function
+df_stats = get_uc_table_stats(table_list)
 display(df_stats.limit(25))
 
-log("=== STEP 3: Tableau extract size bytes (optional) ===")
-df_extracts = get_tableau_extract_sizes()
-
-# Join extracts in a way that works for both datasource-rows and workbook-rows:
-#   - first by datasource_id
-#   - then by workbook_id
+log("=== STEP 3: Enrich mapping with UC stats ===")
 df_enriched = df_map.join(df_stats, on="uc_table_full_name", how="left")
+
+log("=== STEP 4: Tableau extract size bytes (optional proxy) ===")
+df_extracts = get_tableau_extract_sizes()
 
 if df_extracts.count() > 0:
     ds_ex = df_extracts.select(
@@ -627,6 +685,7 @@ if df_extracts.count() > 0:
         "tableau_extract_updated_at",
     )
 
+    # join by datasource_id, then by workbook_id; coalesce
     df_enriched = (
         df_enriched
         .join(ds_ex, (df_enriched.site_id == ds_ex.site_id) & (df_enriched.datasource_id == ds_ex.ds_id), "left")
@@ -645,7 +704,7 @@ else:
     df_enriched = df_enriched.withColumn("tableau_extract_size_bytes", F.lit(None).cast("long")) \
                              .withColumn("tableau_extract_updated_at", F.lit(None).cast("timestamp"))
 
-log("=== STEP 4: Databricks runtime metrics for Tableau queries (optional) ===")
+log("=== STEP 5: Databricks runtime metrics for Tableau queries (optional) ===")
 df_runtime = get_runtime_table_read_metrics(days=DAYS_RUNTIME_WINDOW)
 df_enriched = df_enriched.join(df_runtime, on="uc_table_full_name", how="left")
 
@@ -683,7 +742,7 @@ if final_cnt == 0 and FAIL_JOB_IF_EMPTY:
 
 display(df_enriched.limit(100))
 
-log("=== STEP 5: Write to Delta table (daily partition) ===")
+log("=== STEP 6: Write to Delta table (daily partition) ===")
 target = write_daily_partition(df_enriched, snapshot_date=None)
 log(f"Wrote: {target}")
 
