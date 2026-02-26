@@ -11,16 +11,17 @@
 #   - partitioned by snapshot_date
 #   - each run overwrites ONLY today's partition (idempotent; reruns won’t duplicate)
 #
-# Fixes included:
-#   - Explicit schema for df_stats (prevents “cannot determine type after inferring”)
-#   - Conforms df_out to existing Delta table schema (prevents “Delta failed to merge fields workbook_id and workbook_id”)
+# IMPORTANT FIX (per your note):
+#   - Do NOT rely on table_assets.table_schema to identify npdataset
+#   - Use table_assets.full_name containing 'npdataset' (often like '%[npdataset]%' or '...npdataset...')
+#   - Parse table name from full_name, then validate against eciscor_prod.information_schema.tables
 
 from __future__ import annotations
 
 import json
 import uuid
 from datetime import date, datetime
-from typing import List, Optional, Dict, Tuple
+from typing import List, Optional, Dict
 
 from pyspark.sql import DataFrame, functions as F, types as T
 
@@ -75,9 +76,6 @@ def ensure_schema(catalog: str, schema: str) -> None:
 def target_fqn() -> str:
     return f"{CATALOG}.{TARGET_SCHEMA}.{TARGET_TABLE}"
 
-def _schema_map(schema: T.StructType) -> Dict[str, str]:
-    return {f.name: f.dataType.simpleString() for f in schema.fields}
-
 def _find_duplicate_columns(cols: List[str]) -> List[str]:
     seen = set()
     dups = []
@@ -87,38 +85,8 @@ def _find_duplicate_columns(cols: List[str]) -> List[str]:
         seen.add(c)
     return dups
 
-def conform_to_existing_delta_schema(df: DataFrame, target: str) -> DataFrame:
-    """
-    If target Delta table exists, cast columns in df to match existing types to avoid merge conflicts.
-    Also add any missing columns from target as nulls (cast to the target type).
-    Keeps any *new* columns in df as-is (schema evolution), but avoids type conflicts for existing fields.
-    """
-    if not spark.catalog.tableExists(target):
-        return df
-
-    tgt_schema = spark.table(target).schema
-    tgt_types = {f.name: f.dataType for f in tgt_schema.fields}
-
-    df_cols = set(df.columns)
-
-    # Cast existing target columns
-    out = df
-    for name, dtype in tgt_types.items():
-        if name in df_cols:
-            out = out.withColumn(name, F.col(name).cast(dtype))
-        else:
-            out = out.withColumn(name, F.lit(None).cast(dtype))
-
-    # Reorder: target columns first, then any new columns
-    ordered = [f.name for f in tgt_schema.fields] + [c for c in df.columns if c not in tgt_types]
-    out = out.select(*ordered)
-
-    # Sanity: duplicates
-    dups = _find_duplicate_columns(out.columns)
-    if dups:
-        raise RuntimeError(f"DataFrame has duplicate column names after conforming: {dups}")
-
-    return out
+def _schema_map(schema: T.StructType) -> Dict[str, str]:
+    return {f.name: f.dataType.simpleString() for f in schema.fields}
 
 def log_schema_diff(df: DataFrame, target: str) -> None:
     if not spark.catalog.tableExists(target):
@@ -134,19 +102,49 @@ def log_schema_diff(df: DataFrame, target: str) -> None:
 
     if mismatched:
         log("Schema type mismatches vs target (df_type -> target_type):")
-        for k, a, b in mismatched[:50]:
+        for k, a, b in mismatched[:100]:
             print(f"  - {k}: {a} -> {b}")
     else:
         log("No type mismatches vs target for existing columns.")
 
+def conform_to_existing_delta_schema(df: DataFrame, target: str) -> DataFrame:
+    """
+    If target Delta table exists, cast columns in df to match existing types to avoid merge conflicts.
+    Also add any missing columns from target as nulls (cast to the target type).
+    Keeps any *new* columns in df as-is (schema evolution), but avoids type conflicts for existing fields.
+    """
+    if not spark.catalog.tableExists(target):
+        return df
+
+    tgt_schema = spark.table(target).schema
+    tgt_types = {f.name: f.dataType for f in tgt_schema.fields}
+    df_cols = set(df.columns)
+
+    out = df
+    # Cast/ensure all existing target columns
+    for name, dtype in tgt_types.items():
+        if name in df_cols:
+            out = out.withColumn(name, F.col(name).cast(dtype))
+        else:
+            out = out.withColumn(name, F.lit(None).cast(dtype))
+
+    # Reorder to target columns first, then any new cols
+    ordered = [f.name for f in tgt_schema.fields] + [c for c in df.columns if c not in tgt_types]
+    out = out.select(*ordered)
+
+    dups = _find_duplicate_columns(out.columns)
+    if dups:
+        raise RuntimeError(f"DataFrame has duplicate column names after conforming: {dups}")
+
+    return out
+
 
 # =========================
-# 0) Diagnostics (table_assets + sources)
+# 0) Diagnostics (table_assets focus)
 # =========================
 def diagnose_table_assets() -> None:
     ta_fqn = fqn(TABLEAU_SCHEMA, "table_assets")
     tas_fqn = fqn(TABLEAU_SCHEMA, "table_asset_sources")
-
     wb_fqn = fqn(TABLEAU_SCHEMA, "workbooks")
     vw_fqn = fqn(TABLEAU_SCHEMA, "views")
     ds_fqn = fqn(TABLEAU_SCHEMA, "datasources")
@@ -164,36 +162,38 @@ def diagnose_table_assets() -> None:
     log("=== table_asset_sources columns ===")
     print(tas.columns)
 
-    # Filter to npdataset assets
-    if "table_schema" in ta.columns:
-        ta_np = ta.where(F.lower(F.col("table_schema")) == F.lit(NP_SCHEMA.lower()))
-    else:
-        ta_np = ta.where(F.lower(F.coalesce(F.col("full_name"), F.lit(""))).like(f"%{NP_SCHEMA.lower()}%"))
+    # Primary filter: full_name contains npdataset (do NOT rely on table_schema)
+    ta_np = ta.withColumn("full_name_lc", F.lower(F.coalesce(F.col("full_name"), F.lit("")))) \
+              .where(F.col("full_name_lc").like(f"%{NP_SCHEMA.lower()}%"))
 
     if "is_tombstoned" in ta.columns:
         ta_np = ta_np.where(~F.coalesce(F.col("is_tombstoned"), F.lit(False)))
 
-    cols = ["site_id", "id", "name"]
+    # Show schema distribution among matched rows (useful for your exact issue)
     if "table_schema" in ta.columns:
-        cols += ["table_schema"]
-    if "full_name" in ta.columns:
-        cols += ["full_name"]
+        log("=== table_schema distribution among rows whose full_name contains npdataset ===")
+        display(
+            ta_np.groupBy(F.lower(F.col("table_schema")).alias("table_schema_lc"))
+                 .count()
+                 .orderBy(F.desc("count"))
+        )
 
-    show_df(ta_np.select(*cols), f"table_assets filtered to {NP_SCHEMA}", n=25)
+    cols = ["site_id", "id", "name", "full_name"]
+    if "table_schema" in ta.columns:
+        cols.insert(3, "table_schema")
+    show_df(ta_np.select(*cols), f"table_assets where full_name LIKE '%{NP_SCHEMA}%'", n=25)
 
     if "table_asset_id" not in tas.columns:
         raise RuntimeError("Expected column table_asset_id missing from table_asset_sources.")
 
-    # source_type distribution
+    # Join to sources for distribution
     tas_np = tas.join(
-        ta_np.select(
-            F.col("site_id").alias("s_site_id"),
-            F.col("id").cast("long").alias("s_table_asset_id")
-        ),
+        ta_np.select(F.col("site_id").alias("s_site_id"), F.col("id").cast("long").alias("s_table_asset_id")),
         (tas.site_id == F.col("s_site_id")) & (F.col("table_asset_id").cast("long") == F.col("s_table_asset_id")),
         "inner"
     )
-    log("=== source_type distribution for npdataset table assets ===")
+
+    log("=== source_type distribution for those npdataset-matching table assets (via full_name) ===")
     display(
         tas_np.groupBy(F.lower(F.col("source_type")).alias("source_type"))
               .count()
@@ -202,12 +202,17 @@ def diagnose_table_assets() -> None:
 
 
 # =========================
-# 1) Build ROW-LEVEL mapping (table_assets graph)
+# 1) Build ROW-LEVEL mapping (table_assets graph) using full_name parsing
 # =========================
 def build_rowlevel_mapping_from_table_assets() -> DataFrame:
     """
     Row-level output:
       (npdataset table asset) × (source: workbook OR datasource) × (consumer workbook) × (dashboard)
+
+    Key behavior:
+      - identify npdataset assets by full_name containing 'npdataset'
+      - parse the table name from full_name when possible, otherwise fall back to table_assets.name
+      - validate/canonicalize against eciscor_prod.information_schema.tables for NP_SCHEMA
     """
     ta_fqn = fqn(TABLEAU_SCHEMA, "table_assets")
     tas_fqn = fqn(TABLEAU_SCHEMA, "table_asset_sources")
@@ -220,26 +225,52 @@ def build_rowlevel_mapping_from_table_assets() -> DataFrame:
     for t in [ta_fqn, tas_fqn, wb_fqn, vw_fqn, pr_fqn, ds_fqn, dc_fqn]:
         assert_exists(t)
 
+    # NP tables (canonical list)
+    np_tables = spark.sql(f"""
+      SELECT table_name, lower(table_name) AS table_name_lc
+      FROM {NP_CATALOG}.information_schema.tables
+      WHERE lower(table_schema) = lower('{NP_SCHEMA}')
+    """)
+
     ta = spark.table(ta_fqn)
     tas = spark.table(tas_fqn)
 
-    # Filter to npdataset assets
-    if "table_schema" in ta.columns:
-        ta_np = ta.where(F.lower(F.col("table_schema")) == F.lit(NP_SCHEMA.lower()))
-        table_schema_col = F.col("table_schema")
-    else:
-        ta_np = ta.where(F.lower(F.coalesce(F.col("full_name"), F.lit(""))).like(f"%{NP_SCHEMA.lower()}%"))
-        table_schema_col = F.lit(NP_SCHEMA)
+    # Filter by full_name containing npdataset (primary)
+    ta_f = ta.withColumn("full_name_lc", F.lower(F.coalesce(F.col("full_name"), F.lit("")))) \
+             .where(F.col("full_name_lc").like(f"%{NP_SCHEMA.lower()}%"))
 
     if "is_tombstoned" in ta.columns:
-        ta_np = ta_np.where(~F.coalesce(F.col("is_tombstoned"), F.lit(False)))
+        ta_f = ta_f.where(~F.coalesce(F.col("is_tombstoned"), F.lit(False)))
 
-    ta_np_sel = ta_np.select(
-        F.col("site_id").cast("long").alias("site_id"),
-        F.col("id").cast("long").alias("table_asset_id"),
-        F.col("name").alias("np_table_name"),
-        table_schema_col.alias("np_table_schema"),
-        (F.col("full_name") if "full_name" in ta.columns else F.lit(None)).alias("table_full_name"),
+    # Parse table name from full_name (handles bracketed + dotted forms)
+    # Examples we aim to capture:
+    #   [catalog].[npdataset].[my_table]
+    #   catalog.npdataset.my_table
+    parsed_from_brackets = F.regexp_extract(F.col("full_name"), r"(?i)\[npdataset\]\.\[([^\]]+)\]", 1)
+    parsed_from_dots     = F.regexp_extract(F.col("full_name"), r"(?i)\bnpdataset\b\.([A-Za-z0-9_]+)", 1)
+
+    ta_parsed = (
+        ta_f
+        .withColumn("parsed_table_name",
+                    F.when(F.length(parsed_from_brackets) > 0, parsed_from_brackets)
+                     .when(F.length(parsed_from_dots) > 0, parsed_from_dots)
+                     .otherwise(F.col("name")))
+        .withColumn("candidate_table_lc", F.lower(F.col("parsed_table_name")))
+    )
+
+    # Canonicalize against NP tables list (prevents false positives, fixes casing)
+    ta_np = (
+        ta_parsed.join(np_tables, ta_parsed.candidate_table_lc == np_tables.table_name_lc, "inner")
+                 .select(
+                     F.col("site_id").cast("long").alias("site_id"),
+                     F.col("id").cast("long").alias("table_asset_id"),
+                     F.col("table_name").alias("np_table_name"),          # canonical
+                     F.lit(NP_SCHEMA).alias("np_table_schema"),
+                     F.col("full_name").alias("table_full_name"),
+                     F.col("name").alias("asset_name"),
+                     F.col("parsed_table_name").alias("parsed_table_name"),
+                     (F.col("table_schema") if "table_schema" in ta.columns else F.lit(None)).alias("asset_table_schema"),
+                 )
     )
 
     if "table_asset_id" not in tas.columns:
@@ -252,7 +283,7 @@ def build_rowlevel_mapping_from_table_assets() -> DataFrame:
             F.lower(F.col("source_type")).alias("source_type"),
             F.col("source_id").cast("long").alias("source_id"),
         )
-        .join(ta_np_sel, on=["site_id", "table_asset_id"], how="inner")
+        .join(ta_np, on=["site_id", "table_asset_id"], how="inner")
     )
 
     # Dimensions
@@ -332,7 +363,7 @@ def build_rowlevel_mapping_from_table_assets() -> DataFrame:
           .select("site_id", "datasource_id", "connection_mode")
     )
 
-    # Path 1: workbook sources
+    # Path 1: workbook sources (direct workbook link from table_asset_sources)
     wb_path = (
         sources.where(F.col("source_type") == F.lit("workbook"))
                .withColumn("link_path", F.lit("table_asset_source_workbook"))
@@ -346,6 +377,9 @@ def build_rowlevel_mapping_from_table_assets() -> DataFrame:
                    "np_table_schema",
                    "np_table_name",
                    "table_full_name",
+                   "asset_name",
+                   "parsed_table_name",
+                   "asset_table_schema",
                    "link_path",
                    F.lit("workbook").alias("source_type"),
                    F.lit(None).cast("long").alias("datasource_id"),
@@ -382,6 +416,9 @@ def build_rowlevel_mapping_from_table_assets() -> DataFrame:
                    "np_table_schema",
                    "np_table_name",
                    "table_full_name",
+                   "asset_name",
+                   "parsed_table_name",
+                   "asset_table_schema",
                    "link_path",
                    F.lit("datasource").alias("source_type"),
                    "datasource_id",
@@ -409,7 +446,6 @@ def build_rowlevel_mapping_from_table_assets() -> DataFrame:
         F.concat(F.lit(f"{NP_CATALOG}.{NP_SCHEMA}."), F.col("np_table_name"))
     )
 
-    # Sanity: duplicates
     dups = _find_duplicate_columns(out.columns)
     if dups:
         raise RuntimeError(f"Row-level mapping produced duplicate column names: {dups}")
@@ -460,7 +496,7 @@ def get_uc_table_stats(table_full_names: List[str]) -> DataFrame:
         except Exception:
             pass
 
-        # Fallback parse
+        # Fallback: parse Statistics row from DESCRIBE TABLE EXTENDED
         if src is None:
             try:
                 ext = spark.sql(f"DESCRIBE TABLE EXTENDED {full_name}")
@@ -485,7 +521,7 @@ def get_uc_table_stats(table_full_names: List[str]) -> DataFrame:
             except Exception:
                 pass
 
-        # Fallback describe detail for size
+        # Fallback: DESCRIBE DETAIL (sizeInBytes only)
         if src is None:
             try:
                 det = spark.sql(f"DESCRIBE DETAIL {full_name}")
@@ -597,7 +633,6 @@ def write_daily_partition(df: DataFrame, snapshot_date: Optional[date] = None) -
     ensure_schema(CATALOG, TARGET_SCHEMA)
 
     spark.conf.set("spark.databricks.delta.schema.autoMerge.enabled", "true")
-    spark.conf.set("spark.databricks.delta.schema.autoMerge.enabled", "true")
 
     # Add ingestion columns
     df_out = (
@@ -626,7 +661,6 @@ def write_daily_partition(df: DataFrame, snapshot_date: Optional[date] = None) -
     log_schema_diff(df_out, target)
     df_out = conform_to_existing_delta_schema(df_out, target)
 
-    # If table doesn't exist, create it; else overwrite only today's partition (idempotent)
     if not spark.catalog.tableExists(target):
         log(f"Creating table {target}")
         (df_out.write.format("delta")
@@ -647,18 +681,23 @@ def write_daily_partition(df: DataFrame, snapshot_date: Optional[date] = None) -
 # =========================
 # RUN NOTEBOOK
 # =========================
-log("=== STEP 0: Diagnose table_assets population ===")
+log("=== STEP 0: Diagnose table_assets population (full_name-based) ===")
 diagnose_table_assets()
 
-log("=== STEP 1: Build ROW-LEVEL mapping from table_assets ===")
+log("=== STEP 1: Build ROW-LEVEL mapping from table_assets (full_name-based) ===")
 df_map = build_rowlevel_mapping_from_table_assets()
 map_cnt = df_map.count()
 log(f"df_map rows: {map_cnt:,}")
 if map_cnt == 0 and FAIL_JOB_IF_EMPTY:
-    raise RuntimeError("df_map is empty. Check table_assets/table_asset_sources population and schema filter.")
+    raise RuntimeError(
+        "df_map is empty. Likely causes:\n"
+        " - full_name parsing pattern doesn't match your format\n"
+        " - full_name contains npdataset but table name extraction didn't match information_schema\n"
+        "Try inspecting a few full_name values and adjusting the regex."
+    )
 display(df_map.limit(50))
 
-log("=== STEP 2: UC table stats (explicit schema; fixes 'cannot determine type') ===")
+log("=== STEP 2: UC table stats (explicit schema) ===")
 table_list = [r["uc_table_full_name"] for r in df_map.select("uc_table_full_name").distinct().collect()]
 log(f"Distinct UC tables to stat: {len(table_list)}")
 log(f"Sample tables: {table_list[:10]}")
@@ -685,7 +724,6 @@ if df_extracts.count() > 0:
         "tableau_extract_updated_at",
     )
 
-    # join by datasource_id, then by workbook_id; coalesce
     df_enriched = (
         df_enriched
         .join(ds_ex, (df_enriched.site_id == ds_ex.site_id) & (df_enriched.datasource_id == ds_ex.ds_id), "left")
